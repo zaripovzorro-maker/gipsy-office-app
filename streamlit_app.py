@@ -4,36 +4,30 @@ import firebase_admin
 from firebase_admin import credentials
 from google.cloud import firestore
 
+
 def init_firestore() -> firestore.Client:
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
     if not svc:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой ⋮ → Edit secrets и вставь ключ.")
+        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    # → Поддерживаем ДВА формата секрета:
-    # 1) TOML-таблица: [FIREBASE_SERVICE_ACCOUNT] ... (приходит как Mapping)
-    # 2) JSON-строка: FIREBASE_SERVICE_ACCOUNT = """{ ... }"""
-    if isinstance(svc, (dict,)):
-        data = dict(svc)
+    # Если секция в виде TOML-таблицы — просто словарь
+    if isinstance(svc, dict):
+        data = svc
     else:
-        s = str(svc).strip()
-        if s.startswith("{"):
-            data = json.loads(s)
-        else:
-            st.error(
-                "FIREBASE_SERVICE_ACCOUNT сохранён в неподдерживаемом виде. "
-                "Используй либо TOML-таблицу [FIREBASE_SERVICE_ACCOUNT], либо JSON в тройных кавычках."
-            )
-            st.stop()
+        # если вдруг JSON-строка
+        text = str(svc).strip()
+        data = json.loads(text) if text.startswith("{") else None
 
     if not firebase_admin._apps:
         cred = credentials.Certificate(data)
         firebase_admin.initialize_app(cred)
 
-    project_id = st.secrets.get("PROJECT_ID")
-    return firestore.Client(project=project_id)
+    return firestore.Client(project=st.secrets["PROJECT_ID"])
+
 
 db = init_firestore()
+
 
 # =========================
 #  Бизнес-логика
