@@ -1,12 +1,10 @@
 # streamlit_app.py — Gipsy Office (Streamlit + Firestore)
-
-from collections.abc import Mapping
-
 from __future__ import annotations
 
 import json
 import time
 from typing import Any, Dict, List, Tuple
+from collections.abc import Mapping  # <─ добавили, чтобы поймать AttrDict
 
 import pandas as pd
 import streamlit as st
@@ -18,52 +16,48 @@ from google.cloud import firestore
 
 # -------------------------
 # Firestore init (через Streamlit Secrets)
-# Требуется:
-#   PROJECT_ID = "gipsy-office"
-#   ЛИБО:
-#     [FIREBASE_SERVICE_ACCOUNT]  (TOML-таблица с полями ключа)
-#   ЛИБО:
-#     FIREBASE_SERVICE_ACCOUNT = "<строка JSON ключа>"
 # -------------------------
 def init_firestore() -> firestore.Client:
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
 
-    # Диагностика в сайдбаре (без раскрытия ключа)
+    # Диагностика (чтобы понимать, что реально читается)
     st.sidebar.write("Secrets status:")
     st.sidebar.write(f"- PROJECT_ID present: {'PROJECT_ID' in st.secrets}")
     st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc).__name__}")
 
     if not svc:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
+        st.error("❌ В Secrets нет FIREBASE_SERVICE_ACCOUNT. Проверь Manage app → Edit secrets.")
         st.stop()
 
-    if isinstance(svc, Mapping):  # поймает AttrDict
-    data = dict(svc)  # TOML-таблица — это dict
+    # Поддерживаем AttrDict и dict
+    if isinstance(svc, Mapping):
+        data = dict(svc)
     elif isinstance(svc, str):
         s = svc.strip()
         if not s.startswith("{"):
-            st.error("JSON-строка должна начинаться с { … } или используйте таблицу TOML.")
+            st.error("❌ JSON-строка должна начинаться с '{'. Либо используй таблицу TOML.")
             st.stop()
-        import json
         data = json.loads(s)
     else:
-        st.error(f"Неподдерживаемый тип секрета: {type(svc).__name__}. Ожидается dict (TOML) или str (JSON).")
+        st.error(f"❌ Неподдерживаемый тип секрета: {type(svc).__name__}")
         st.stop()
 
+    # Инициализация Firebase
     if not firebase_admin._apps:
         cred = credentials.Certificate(data)
         firebase_admin.initialize_app(cred)
 
     project_id = st.secrets.get("PROJECT_ID")
     if not project_id:
-        st.error('В Secrets отсутствует PROJECT_ID (например: "gipsy-office").')
+        st.error("❌ В Secrets отсутствует PROJECT_ID = 'gipsy-office'")
         st.stop()
 
     return firestore.Client(project=project_id)
 
 
-
+# Создаём подключение
 db = init_firestore()
+
 
 # -------------------------
 # Конфигурация склада
