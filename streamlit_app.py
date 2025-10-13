@@ -1,12 +1,5 @@
 # streamlit_app.py
-# ──────────────────────────────────────────────────────────────────────────────
 # Gipsy Office — учёт списаний (Streamlit + Firestore)
-# Вкладки: "Позиции" (списание) и "Склад" (остатки, статусы, экспорт)
-# Требуется коллекции в Firestore:
-#   - ingredients (документы: <ingredientId> ; поля: stock_quantity: number, unit: "g"/"ml")
-#   - products   (документы: <productId>    ; поля: name: string, price: number)
-#   - recipes    (документы: <productId>    ; поля: items: [{ingredientId: str, qtyPer: number}])
-# ──────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
@@ -22,16 +15,24 @@ from firebase_admin import credentials
 from google.cloud import firestore
 
 
-# ==========================
+# -------------------------
 # Firestore init (secrets)
-# ==========================
+# -------------------------
 def init_firestore() -> firestore.Client:
     """
-    Инициализируем Firebase Admin из Streamlit secrets.
-    Поддерживаются два формата:
-      A) FIREBASE_SERVICE_ACCOUNT = """{…json…}"""
-      B) [FIREBASE_SERVICE_ACCOUNT] ...  (TOML-таблица)
-    И нужен PROJECT_ID = "gipsy-office"
+    Инициализация Firebase Admin из Streamlit secrets.
+    Поддерживаются два формата secrets:
+    1) TOML-таблица:
+       [FIREBASE_SERVICE_ACCOUNT]
+       type = "service_account"
+       ... остальные поля ...
+       PROJECT_ID = "gipsy-office"
+
+    2) JSON-строка:
+       FIREBASE_SERVICE_ACCOUNT = """
+       { "type": "service_account", ... }   <- обычный JSON
+       """
+       PROJECT_ID = "gipsy-office"
     """
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
     if not svc:
@@ -41,7 +42,7 @@ def init_firestore() -> firestore.Client:
         )
         st.stop()
 
-    # TOML-таблица приходит как dict; JSON-строка — как str
+    # Если в secrets пришла таблица TOML — это dict; если строка — это str JSON
     if isinstance(svc, dict):
         data = dict(svc)
     else:
@@ -50,9 +51,8 @@ def init_firestore() -> firestore.Client:
             data = json.loads(s)
         else:
             st.error(
-                "FIREBASE_SERVICE_ACCOUNT сохранён в неподдерживаемом виде.\n"
-                "Используйте либо TOML-таблицу [FIREBASE_SERVICE_ACCOUNT], "
-                "либо JSON в тройных кавычках."
+                "FIREBASE_SERVICE_ACCOUNT сохранён в неподдерживаемом виде. "
+                "Используйте TOML-таблицу [FIREBASE_SERVICE_ACCOUNT] или JSON-строку."
             )
             st.stop()
 
@@ -70,10 +70,9 @@ def init_firestore() -> firestore.Client:
 
 db = init_firestore()
 
-# ==========================
+# -------------------------
 # Доменные настройки
-# ==========================
-# Нормы для процента заполнения
+# -------------------------
 DEFAULT_CAPACITY: Dict[str, float] = {
     "beans": 2000.0,  # грамм
     "milk": 5000.0,   # мл
@@ -88,10 +87,6 @@ STATUS_LABELS = [
 
 
 def human_status(value: float, capacity: float) -> str:
-    """
-    Возвращает текстовый статус по порогам.
-    value и capacity в одних единицах (г/мл).
-    """
     if capacity <= 0:
         return "Нет нормы"
     pct = max(0.0, min(1.0, value / capacity))
@@ -101,9 +96,9 @@ def human_status(value: float, capacity: float) -> str:
     return STATUS_LABELS[-1][1]
 
 
-# ==========================
+# -------------------------
 # Firestore helpers
-# ==========================
+# -------------------------
 def _ingredients_ref():
     return db.collection("ingredients")
 
@@ -117,7 +112,6 @@ def _recipes_ref():
 
 
 def get_ingredients() -> List[Dict[str, Any]]:
-    """Читает все ингредиенты. Если нет — возвращает пустой список."""
     docs = _ingredients_ref().stream()
     items: List[Dict[str, Any]] = []
     for d in docs:
@@ -127,14 +121,12 @@ def get_ingredients() -> List[Dict[str, Any]]:
             "stock_quantity": float(data.get("stock_quantity", 0.0)),
             "unit": str(data.get("unit", "g" if d.id == "beans" else "ml")),
         })
-    # подставим capacity из DEFAULT_CAPACITY (если есть)
     for x in items:
         x["capacity"] = float(DEFAULT_CAPACITY.get(x["id"], 0))
     return sorted(items, key=lambda x: x["id"])
 
 
 def get_products() -> List[Dict[str, Any]]:
-    """Читает все продукты из коллекции products."""
     docs = _products_ref().stream()
     items: List[Dict[str, Any]] = []
     for d in docs:
@@ -148,10 +140,6 @@ def get_products() -> List[Dict[str, Any]]:
 
 
 def get_recipe(product_id: str) -> List[Dict[str, Any]]:
-    """
-    Возвращает массив {ingredientId, qtyPer} из документа recipes/<product_id>.
-    Если документа нет — пустой список.
-    """
     doc = _recipes_ref().document(product_id).get()
     if not doc.exists:
         return []
@@ -166,7 +154,6 @@ def get_recipe(product_id: str) -> List[Dict[str, Any]]:
     return out
 
 
-# транзакционное изменение одного ингредиента (нельзя уйти в минус)
 def _adjust_tx(transaction, ingredient_id: str, delta: float):
     ref = _ingredients_ref().document(ingredient_id)
     snap = ref.get(transaction=transaction)
@@ -182,7 +169,6 @@ def adjust(ingredient_id: str, delta: float):
     tx.run(lambda t: _adjust_tx(t, ingredient_id, delta))
 
 
-# продажа продукта: вычесть ингредиенты по рецепту
 def sell_product(product_id: str) -> Tuple[bool, str]:
     recipe = get_recipe(product_id)
     if not recipe:
@@ -197,7 +183,6 @@ def sell_product(product_id: str) -> Tuple[bool, str]:
 
         db.transaction().run(_tx)
 
-        # запишем "последнюю продажу" для Undo
         db.collection("meta").document("lastSale").set({
             "ts": firestore.SERVER_TIMESTAMP,
             "productId": product_id,
@@ -222,25 +207,23 @@ def undo_last_sale() -> Tuple[bool, str]:
     try:
         def _tx(t):
             for it in deltas:
-                _adjust_tx(t, it["ingredientId"], -float(it["delta"]))  # обратный знак
+                _adjust_tx(t, it["ingredientId"], -float(it["delta"]))
 
         db.transaction().run(_tx)
-        # очистим лог
         db.collection("meta").document("lastSale").delete()
         return True, "Последняя продажа отменена"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
 
-# ==========================
+# -------------------------
 # UI
-# ==========================
+# -------------------------
 st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
 st.title("☕ gipsy-office — учёт списаний")
 
 tab1, tab2 = st.tabs(["Позиции", "Склад"])
 
-# --- Позиции ---
 with tab1:
     prods = get_products()
     if not prods:
@@ -256,7 +239,7 @@ with tab1:
             price = p["price"]
             r1, r2, r3 = st.columns([6, 2, 2])
             r1.write(name)
-            r2.write(int(price) if price.is_integer() else price)
+            r2.write(int(price) if float(price).is_integer() else price)
             if r3.button("Списать", key=f"sell-{p['id']}"):
                 ok, msg = sell_product(p["id"])
                 if ok:
@@ -271,19 +254,16 @@ with tab1:
         (st.success if ok else st.error)(msg)
         st.rerun()
 
-# --- Склад ---
 with tab2:
     ing = get_ingredients()
     if not ing:
         st.info("Добавьте документы в коллекцию `ingredients`.")
     else:
-        # быстрые шаги по юнитам
         def steps_for_unit(u: str) -> List[Tuple[str, float]]:
             if u == "g":
                 return [("+50 g", 50), ("+100 g", 100), ("-10 g", -10), ("-50 g", -50)]
             return [("+50 ml", 50), ("+100 ml", 100), ("-10 ml", -10), ("-50 ml", -50)]
 
-        # левая — кнопки, правая — остатки/статусы
         lc, rc = st.columns([7, 5])
 
         with lc:
@@ -300,7 +280,6 @@ with tab2:
                         except Exception as e:
                             st.error(str(e))
                         st.rerun()
-                # произвольный delta
                 delta = cols[-1].number_input("±число", key=f"num-{item['id']}", value=0.0, step=10.0)
                 if st.button("Применить", key=f"apply-{item['id']}"):
                     try:
@@ -320,7 +299,7 @@ with tab2:
                 status = human_status(val, cap) if cap > 0 else "Нет нормы"
                 rows.append({
                     "Ингредиент": x["id"],
-                    "Остаток": f"{int(val) if val.is_integer() else round(val, 1)} {x['unit']}",
+                    "Остаток": f"{int(val) if float(val).is_integer() else round(val, 1)} {x['unit']}",
                     "Норма": f"{int(cap)} {x['unit']}" if cap else "—",
                     "Статус": status,
                     "Процент": round(100 * val / cap) if cap else 0,
@@ -329,7 +308,6 @@ with tab2:
             st.dataframe(df, hide_index=True, use_container_width=True)
 
             st.write("")
-            # Экспорт списков на закупку
             def low_df(th: float) -> pd.DataFrame:
                 data = []
                 for x in ing:
@@ -361,5 +339,3 @@ with tab2:
                 file_name=f"need_to_buy_under_50_{int(time.time())}.csv",
                 mime="text/csv",
             )
-
-# ──────────────────────────────────────────────────────────────────────────────
