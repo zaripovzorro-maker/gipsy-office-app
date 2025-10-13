@@ -10,11 +10,21 @@ def init_firestore() -> firestore.Client:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой ⋮ → Edit secrets и вставь ключ.")
         st.stop()
 
-    # Приходит либо строка (JSON), либо Mapping (таблица TOML)
-    if isinstance(svc, str):
-        data = json.loads(svc)
-    else:
+    # → Поддерживаем ДВА формата секрета:
+    # 1) TOML-таблица: [FIREBASE_SERVICE_ACCOUNT] ... (приходит как Mapping)
+    # 2) JSON-строка: FIREBASE_SERVICE_ACCOUNT = """{ ... }"""
+    if isinstance(svc, (dict,)):
         data = dict(svc)
+    else:
+        s = str(svc).strip()
+        if s.startswith("{"):
+            data = json.loads(s)
+        else:
+            st.error(
+                "FIREBASE_SERVICE_ACCOUNT сохранён в неподдерживаемом виде. "
+                "Используй либо TOML-таблицу [FIREBASE_SERVICE_ACCOUNT], либо JSON в тройных кавычках."
+            )
+            st.stop()
 
     if not firebase_admin._apps:
         cred = credentials.Certificate(data)
