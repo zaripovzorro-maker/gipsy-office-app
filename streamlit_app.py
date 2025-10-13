@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Dict, List, Tuple
-from collections.abc import Mapping  # <─ добавили, чтобы поймать AttrDict
+from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
@@ -20,7 +20,7 @@ from google.cloud import firestore
 def init_firestore() -> firestore.Client:
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
 
-    # Диагностика (чтобы понимать, что реально читается)
+    # Диагностика в сайдбаре (не показывает секреты)
     st.sidebar.write("Secrets status:")
     st.sidebar.write(f"- PROJECT_ID present: {'PROJECT_ID' in st.secrets}")
     st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc).__name__}")
@@ -29,7 +29,7 @@ def init_firestore() -> firestore.Client:
         st.error("❌ В Secrets нет FIREBASE_SERVICE_ACCOUNT. Проверь Manage app → Edit secrets.")
         st.stop()
 
-    # Поддерживаем AttrDict и dict
+    # Поддерживаем AttrDict, dict и JSON-строку
     if isinstance(svc, Mapping):
         data = dict(svc)
     elif isinstance(svc, str):
@@ -42,17 +42,60 @@ def init_firestore() -> firestore.Client:
         st.error(f"❌ Неподдерживаемый тип секрета: {type(svc).__name__}")
         st.stop()
 
+    # Валидация ключа
+    required = [
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "token_uri",
+    ]
+    missing = [k for k in required if not data.get(k)]
+    problems = []
+    if missing:
+        problems.append(f"Отсутствуют поля: {', '.join(missing)}")
+
+    if data.get("type") != "service_account":
+        problems.append('Поле "type" должно быть "service_account"')
+
+    pk = str(data.get("private_key", ""))
+    starts_ok = pk.startswith("-----BEGIN PRIVATE KEY-----")
+    ends_ok = pk.strip().endswith("-----END PRIVATE KEY-----")
+    if not starts_ok or not ends_ok:
+        problems.append("Поле private_key должно начинаться с '-----BEGIN PRIVATE KEY-----' и заканчиваться '-----END PRIVATE KEY-----'")
+
+    email = str(data.get("client_email", ""))
+    if "@gipsy-office.iam.gserviceaccount.com" not in email:
+        problems.append("client_email не совпадает с проектом gipsy-office (проверь project_id и email)")
+
+    st.sidebar.write(f"- key headers ok: {starts_ok and ends_ok}")
+    st.sidebar.write(f"- required fields present: {len(missing) == 0}")
+
+    if problems:
+        st.error("🚫 Неверный формат сервис-аккаунта:\n- " + "\n- ".join(problems))
+        st.stop()
+
     # Инициализация Firebase
     if not firebase_admin._apps:
-        cred = credentials.Certificate(data)
-        firebase_admin.initialize_app(cred)
+        try:
+            cred = credentials.Certificate(data)
+            firebase_admin.initialize_app(cred)
+        except Exception:
+            st.error("🚫 Не удалось инициализировать Firebase Admin. Проверь поле private_key и project_id.")
+            st.stop()
 
     project_id = st.secrets.get("PROJECT_ID")
     if not project_id:
-        st.error("❌ В Secrets отсутствует PROJECT_ID = 'gipsy-office'")
+        st.error("🚫 В Secrets отсутствует PROJECT_ID (например: 'gipsy-office').")
         st.stop()
 
-    return firestore.Client(project=project_id)
+    try:
+        return firestore.Client(project=project_id)
+    except Exception:
+        st.error("🚫 Не удалось создать Firestore client. Проверь роли и включён ли Firestore в Firebase.")
+        st.stop()
 
 
 # Создаём подключение
