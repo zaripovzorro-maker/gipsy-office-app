@@ -1,24 +1,23 @@
 import json
-import time
-from typing import Optional
-
-import pandas as pd
 import streamlit as st
-
 import firebase_admin
 from firebase_admin import credentials
 from google.cloud import firestore
 
-# --- Firestore init ---
 def init_firestore() -> firestore.Client:
-    svc_raw = (st.secrets.get("FIREBASE_SERVICE_ACCOUNT") or "").strip()
-    if not svc_raw:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой меню ⋮ → Edit secrets и вставь JSON ключ.")
+    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
+    if not svc:
+        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой ⋮ → Edit secrets и вставь ключ.")
         st.stop()
 
-    # ВАЖНО: проверяем именно firebase_admin._apps
+    # Приходит либо строка (JSON), либо Mapping (таблица TOML)
+    if isinstance(svc, str):
+        data = json.loads(svc)
+    else:
+        data = dict(svc)
+
     if not firebase_admin._apps:
-        cred = credentials.Certificate(json.loads(svc_raw))
+        cred = credentials.Certificate(data)
         firebase_admin.initialize_app(cred)
 
     project_id = st.secrets.get("PROJECT_ID")
