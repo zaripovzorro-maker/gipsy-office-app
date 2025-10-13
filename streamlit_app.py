@@ -1,11 +1,10 @@
-# streamlit_app.py
-# Gipsy Office — учёт списаний (Streamlit + Firestore)
+# streamlit_app.py — Gipsy Office (Streamlit + Firestore)
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -16,43 +15,29 @@ from google.cloud import firestore
 
 
 # -------------------------
-# Firestore init (secrets)
+# Firestore init (через Streamlit Secrets)
+# Требуется:
+#   PROJECT_ID = "gipsy-office"
+#   ЛИБО:
+#     [FIREBASE_SERVICE_ACCOUNT]  (TOML-таблица с полями ключа)
+#   ЛИБО:
+#     FIREBASE_SERVICE_ACCOUNT = "<строка JSON ключа>"
 # -------------------------
 def init_firestore() -> firestore.Client:
-    """
-    Инициализация Firebase Admin из Streamlit secrets.
-
-    Поддерживаются два формата secrets:
-    1) TOML-таблица:
-       [FIREBASE_SERVICE_ACCOUNT]
-       type = "service_account"
-       ...
-       PROJECT_ID = "gipsy-office"
-
-    2) JSON-строка:
-       FIREBASE_SERVICE_ACCOUNT = """{ "type": "service_account", ... }"""
-       PROJECT_ID = "gipsy-office"
-    """
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
     if not svc:
-        st.error(
-            "В Secrets нет FIREBASE_SERVICE_ACCOUNT. "
-            "Откройте Manage app → Advanced settings → Edit secrets и вставьте ключ."
-        )
+        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Откройте Manage app → Advanced settings → Edit secrets и вставьте ключ.")
         st.stop()
 
-    # Если в secrets пришла таблица TOML — это dict; если строка — это JSON
+    # Преобразуем secrets к dict с полями сервис-аккаунта
     if isinstance(svc, dict):
         data = dict(svc)
     else:
         s = str(svc).strip()
-        if s.startswith("{"):
+        try:
             data = json.loads(s)
-        else:
-            st.error(
-                "FIREBASE_SERVICE_ACCOUNT сохранён в неподдерживаемом виде. "
-                "Используйте TOML-таблицу [FIREBASE_SERVICE_ACCOUNT] или JSON-строку."
-            )
+        except Exception:
+            st.error("FIREBASE_SERVICE_ACCOUNT должен быть таблицей TOML или строкой JSON.")
             st.stop()
 
     if not firebase_admin._apps:
@@ -61,7 +46,7 @@ def init_firestore() -> firestore.Client:
 
     project_id = st.secrets.get("PROJECT_ID")
     if not project_id:
-        st.error('В Secrets отсутствует PROJECT_ID = "gipsy-office"')
+        st.error('В Secrets отсутствует PROJECT_ID (например: "gipsy-office").')
         st.stop()
 
     return firestore.Client(project=project_id)
@@ -70,14 +55,14 @@ def init_firestore() -> firestore.Client:
 db = init_firestore()
 
 # -------------------------
-# Доменные настройки
+# Конфигурация склада
 # -------------------------
 DEFAULT_CAPACITY: Dict[str, float] = {
     "beans": 2000.0,  # грамм
     "milk": 5000.0,   # мл
 }
 
-STATUS_LABELS = [
+STATUS_LABELS: List[Tuple[float, str]] = [
     (0.75, "Супер"),
     (0.50, "Норм"),
     (0.25, "Готовиться к закупке"),
@@ -121,7 +106,7 @@ def get_ingredients() -> List[Dict[str, Any]]:
             "unit": str(data.get("unit", "g" if d.id == "beans" else "ml")),
         })
     for x in items:
-        x["capacity"] = float(DEFAULT_CAPACITY.get(x["id"], 0))
+        x["capacity"] = float(DEFAULT_CAPACITY.get(x["id"], 0.0))
     return sorted(items, key=lambda x: x["id"])
 
 
@@ -268,8 +253,10 @@ with tab2:
         with lc:
             st.subheader("Склад (операции)")
             for item in ing:
-                st.markdown(f"**{item['id'].capitalize()}**  \n"
-                            f"{round(100 * item['stock_quantity'] / (item['capacity'] or 1)):d}%")
+                st.markdown(
+                    f"**{item['id'].capitalize()}**  \n"
+                    f"{round(100 * item['stock_quantity'] / (item['capacity'] or 1)):d}%"
+                )
                 cols = st.columns(5)
                 for i, (label, d) in enumerate(steps_for_unit(item["unit"])):
                     if cols[i].button(label, key=f"inc-{item['id']}-{label}"):
