@@ -11,11 +11,9 @@ def init_firestore() -> firestore.Client:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    # Если секция в виде TOML-таблицы — просто словарь
-    if isinstance(svc, dict):
+    if isinstance(svc, dict):         # ✅ теперь читаем как словарь
         data = svc
     else:
-        # если вдруг JSON-строка
         text = str(svc).strip()
         data = json.loads(text) if text.startswith("{") else None
 
