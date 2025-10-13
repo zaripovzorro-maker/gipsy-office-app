@@ -25,20 +25,28 @@ from google.cloud import firestore
 # -------------------------
 def init_firestore() -> firestore.Client:
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
+
+    # Диагностика в сайдбаре (без раскрытия ключа)
+    st.sidebar.write("Secrets status:")
+    st.sidebar.write(f"- PROJECT_ID present: {'PROJECT_ID' in st.secrets}")
+    st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc).__name__}")
+
     if not svc:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Откройте Manage app → Advanced settings → Edit secrets и вставьте ключ.")
+        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    # Преобразуем secrets к dict с полями сервис-аккаунта
     if isinstance(svc, dict):
-        data = dict(svc)
-    else:
-        s = str(svc).strip()
-        try:
-            data = json.loads(s)
-        except Exception:
-            st.error("FIREBASE_SERVICE_ACCOUNT должен быть таблицей TOML или строкой JSON.")
+        data = dict(svc)  # TOML-таблица — это dict
+    elif isinstance(svc, str):
+        s = svc.strip()
+        if not s.startswith("{"):
+            st.error("JSON-строка должна начинаться с { … } или используйте таблицу TOML.")
             st.stop()
+        import json
+        data = json.loads(s)
+    else:
+        st.error(f"Неподдерживаемый тип секрета: {type(svc).__name__}. Ожидается dict (TOML) или str (JSON).")
+        st.stop()
 
     if not firebase_admin._apps:
         cred = credentials.Certificate(data)
@@ -50,6 +58,7 @@ def init_firestore() -> firestore.Client:
         st.stop()
 
     return firestore.Client(project=project_id)
+
 
 
 db = init_firestore()
