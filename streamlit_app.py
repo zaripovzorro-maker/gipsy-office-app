@@ -21,17 +21,16 @@ from google.cloud import firestore
 def init_firestore() -> firestore.Client:
     """
     Инициализация Firebase Admin из Streamlit secrets.
+
     Поддерживаются два формата secrets:
     1) TOML-таблица:
        [FIREBASE_SERVICE_ACCOUNT]
        type = "service_account"
-       ... остальные поля ...
+       ...
        PROJECT_ID = "gipsy-office"
 
     2) JSON-строка:
-       FIREBASE_SERVICE_ACCOUNT = """
-       { "type": "service_account", ... }   <- обычный JSON
-       """
+       FIREBASE_SERVICE_ACCOUNT = """{ "type": "service_account", ... }"""
        PROJECT_ID = "gipsy-office"
     """
     svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
@@ -42,7 +41,7 @@ def init_firestore() -> firestore.Client:
         )
         st.stop()
 
-    # Если в secrets пришла таблица TOML — это dict; если строка — это str JSON
+    # Если в secrets пришла таблица TOML — это dict; если строка — это JSON
     if isinstance(svc, dict):
         data = dict(svc)
     else:
