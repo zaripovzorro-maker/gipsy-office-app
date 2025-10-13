@@ -1,136 +1,83 @@
-# streamlit_app.py — Gipsy Office (Streamlit + Firestore)
-from __future__ import annotations
-
+# -*- coding: utf-8 -*-
+import os
 import json
 import time
-from typing import Any, Dict, List, Tuple
-from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import streamlit as st
 
-import firebase_admin
-from firebase_admin import credentials
+# --- Firebase / Firestore ---
+from firebase_admin import credentials, initialize_app, _apps as firebase_apps
 from google.cloud import firestore
 
 
-# -------------------------
-# Firestore init (через Streamlit Secrets)
-# -------------------------
+# -------------------------------
+# Настройки по умолчанию (нормы)
+# -------------------------------
+DEFAULT_CAPACITY: Dict[str, float] = {
+    "beans": 2000.0,   # грамм
+    "milk": 5000.0,    # мл
+}
+
+# -------------------------------
+# Инициализация Firestore
+# -------------------------------
 def init_firestore() -> firestore.Client:
-    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
+    """
+    Читает ключ из st.secrets["FIREBASE_SERVICE_ACCOUNT"] (JSON-строка или TOML-таблица)
+    и PROJECT_ID. Возвращает firestore.Client.
+    """
+    # 1) PROJECT_ID из secrets или ENV
+    project_id = (st.secrets.get("PROJECT_ID") or os.getenv("PROJECT_ID") or "").strip()
+    # 2) Сам ключ
+    svc_raw: Any = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
 
-    # Диагностика в сайдбаре (не показывает секреты)
-    st.sidebar.write("Secrets status:")
-    st.sidebar.write(f"- PROJECT_ID present: {'PROJECT_ID' in st.secrets}")
-    st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc).__name__}")
-
-    if not svc:
-        st.error("❌ В Secrets нет FIREBASE_SERVICE_ACCOUNT. Проверь Manage app → Edit secrets.")
-        st.stop()
-
-    # Поддерживаем AttrDict, dict и JSON-строку
-    if isinstance(svc, Mapping):
-        data = dict(svc)
-    elif isinstance(svc, str):
-        s = svc.strip()
-        if not s.startswith("{"):
-            st.error("❌ JSON-строка должна начинаться с '{'. Либо используй таблицу TOML.")
-            st.stop()
-        data = json.loads(s)
-    else:
-        st.error(f"❌ Неподдерживаемый тип секрета: {type(svc).__name__}")
-        st.stop()
-
-    # Валидация ключа
-    required = [
-        "type",
-        "project_id",
-        "private_key_id",
-        "private_key",
-        "client_email",
-        "client_id",
-        "token_uri",
-    ]
-    missing = [k for k in required if not data.get(k)]
-    problems = []
-    if missing:
-        problems.append(f"Отсутствуют поля: {', '.join(missing)}")
-
-    if data.get("type") != "service_account":
-        problems.append('Поле "type" должно быть "service_account"')
-
-    pk = str(data.get("private_key", ""))
-    starts_ok = pk.startswith("-----BEGIN PRIVATE KEY-----")
-    ends_ok = pk.strip().endswith("-----END PRIVATE KEY-----")
-    if not starts_ok or not ends_ok:
-        problems.append("Поле private_key должно начинаться с '-----BEGIN PRIVATE KEY-----' и заканчиваться '-----END PRIVATE KEY-----'")
-
-    email = str(data.get("client_email", ""))
-    if "@gipsy-office.iam.gserviceaccount.com" not in email:
-        problems.append("client_email не совпадает с проектом gipsy-office (проверь project_id и email)")
-
-    st.sidebar.write(f"- key headers ok: {starts_ok and ends_ok}")
-    st.sidebar.write(f"- required fields present: {len(missing) == 0}")
-
-    if problems:
-        st.error("🚫 Неверный формат сервис-аккаунта:\n- " + "\n- ".join(problems))
-        st.stop()
-
-    # Инициализация Firebase
-    if not firebase_admin._apps:
-        try:
-            cred = credentials.Certificate(data)
-            firebase_admin.initialize_app(cred)
-        except Exception:
-            st.error("🚫 Не удалось инициализировать Firebase Admin. Проверь поле private_key и project_id.")
-            st.stop()
-
-    project_id = st.secrets.get("PROJECT_ID")
     if not project_id:
-        st.error("🚫 В Secrets отсутствует PROJECT_ID (например: 'gipsy-office').")
+        st.error("❌ В secrets нет PROJECT_ID. Открой меню ⋯ → **Edit secrets** и добавь `PROJECT_ID = \"gipsy-office\"`.")
         st.stop()
 
-    try:
-        return firestore.Client(project=project_id)
-    except Exception:
-        st.error("🚫 Не удалось создать Firestore client. Проверь роли и включён ли Firestore в Firebase.")
+    if svc_raw is None:
+        st.error("❌ В secrets нет FIREBASE_SERVICE_ACCOUNT. Вставь **полный JSON** сервис-аккаунта либо TOML-таблицу.")
         st.stop()
 
+    # JSON-строка или TOML-таблица — приведём к dict
+    if isinstance(svc_raw, str):
+        try:
+            svc = json.loads(svc_raw)
+        except Exception:
+            st.error("❌ FIREBASE_SERVICE_ACCOUNT задан строкой, но это не валидный JSON. Скопируй ключ ещё раз целиком.")
+            st.stop()
+    elif isinstance(svc_raw, dict):
+        svc = dict(svc_raw)
+    else:
+        st.error("❌ FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML (мэп).")
+        st.stop()
 
-# Создаём подключение
+    # Небольшая диагностика в сайдбаре
+    with st.sidebar:
+        st.caption("🔎 Диагностика секретов")
+        st.write("PROJECT_ID:", project_id)
+        st.write("FIREBASE_SERVICE_ACCOUNT type:", type(svc_raw).__name__)
+        st.write("has private_key:", bool(svc.get("private_key")))
+        st.write("sa project_id:", svc.get("project_id"))
+
+    # Инициализация firebase_admin (ровно один раз)
+    cred = credentials.Certificate(svc)
+    if not firebase_apps:
+        initialize_app(cred, {"projectId": project_id})
+
+    # Клиент Firestore с явным проектом/кредитами
+    return firestore.Client(project=project_id, credentials=cred)
+
+
+# Глобальный клиент БД
 db = init_firestore()
 
 
-# -------------------------
-# Конфигурация склада
-# -------------------------
-DEFAULT_CAPACITY: Dict[str, float] = {
-    "beans": 2000.0,  # грамм
-    "milk": 5000.0,   # мл
-}
-
-STATUS_LABELS: List[Tuple[float, str]] = [
-    (0.75, "Супер"),
-    (0.50, "Норм"),
-    (0.25, "Готовиться к закупке"),
-    (0.00, "Срочно докупить"),
-]
-
-
-def human_status(value: float, capacity: float) -> str:
-    if capacity <= 0:
-        return "Нет нормы"
-    pct = max(0.0, min(1.0, value / capacity))
-    for thr, label in STATUS_LABELS:
-        if pct >= thr:
-            return label
-    return STATUS_LABELS[-1][1]
-
-
-# -------------------------
-# Firestore helpers
-# -------------------------
+# -------------------------------
+# Утилиты коллекций
+# -------------------------------
 def _ingredients_ref():
     return db.collection("ingredients")
 
@@ -143,233 +90,310 @@ def _recipes_ref():
     return db.collection("recipes")
 
 
+def _sales_ref():
+    return db.collection("sales")
+
+
+# -------------------------------
+# Чтение данных с защитой
+# -------------------------------
 def get_ingredients() -> List[Dict[str, Any]]:
-    docs = _ingredients_ref().stream()
-    items: List[Dict[str, Any]] = []
-    for d in docs:
-        data = d.to_dict() or {}
-        items.append({
-            "id": d.id,
-            "stock_quantity": float(data.get("stock_quantity", 0.0)),
-            "unit": str(data.get("unit", "g" if d.id == "beans" else "ml")),
-        })
-    for x in items:
-        x["capacity"] = float(DEFAULT_CAPACITY.get(x["id"], 0.0))
-    return sorted(items, key=lambda x: x["id"])
+    try:
+        docs = _ingredients_ref().stream()
+        items: List[Dict[str, Any]] = []
+        for d in docs:
+            data = d.to_dict() or {}
+            items.append({
+                "id": d.id,
+                "name": data.get("name", d.id),
+                "stock_quantity": float(data.get("stock_quantity", 0)),
+                "unit": data.get("unit", "g" if d.id == "beans" else "ml"),
+                "capacity": float(data.get("capacity", DEFAULT_CAPACITY.get(d.id, 0))),
+                "reorder_threshold": float(data.get("reorder_threshold", 0)),
+            })
+        return sorted(items, key=lambda x: x["id"])
+    except Exception as e:
+        st.error(f"⚠️ Firestore (ingredients) не отвечает: {e.__class__.__name__}")
+        st.info("Проверь, что Firestore создан и у сервисного аккаунта есть роль **Cloud Datastore User**.")
+        st.stop()
 
 
 def get_products() -> List[Dict[str, Any]]:
-    docs = _products_ref().stream()
-    items: List[Dict[str, Any]] = []
-    for d in docs:
-        data = d.to_dict() or {}
-        items.append({
-            "id": d.id,
-            "name": data.get("name", d.id),
-            "price": float(data.get("price", 0)),
-        })
-    return sorted(items, key=lambda x: x["name"].lower())
+    try:
+        docs = _products_ref().stream()
+        items: List[Dict[str, Any]] = []
+        for d in docs:
+            data = d.to_dict() or {}
+            items.append({
+                "id": d.id,
+                "name": data.get("name", d.id),
+                "price": float(data.get("price", 0)),
+            })
+        return sorted(items, key=lambda x: x["name"].lower())
+    except Exception as e:
+        st.error(f"⚠️ Firestore (products) не отвечает: {e.__class__.__name__}")
+        st.stop()
 
 
 def get_recipe(product_id: str) -> List[Dict[str, Any]]:
-    doc = _recipes_ref().document(product_id).get()
-    if not doc.exists:
-        return []
-    data = doc.to_dict() or {}
-    items = data.get("items", []) or []
-    out: List[Dict[str, Any]] = []
+    try:
+        doc = _recipes_ref().document(product_id).get()
+        if not doc.exists:
+            return []
+        data = doc.to_dict() or {}
+        return list(data.get("items", []))
+    except Exception as e:
+        st.error(f"⚠️ Firestore (recipes) не отвечает: {e.__class__.__name__}")
+        st.stop()
+
+
+# -------------------------------
+# Транзакции: продажа / откат
+# -------------------------------
+def _sell_tx(tx: firestore.Transaction, product_id: str):
+    items = get_recipe(product_id)
+    if not items:
+        raise ValueError(f"Для продукта '{product_id}' нет рецепта.")
+
+    # проверяем и списываем
     for it in items:
-        out.append({
-            "ingredientId": str(it.get("ingredientId")),
-            "qtyPer": float(it.get("qtyPer", 0)),
-        })
-    return out
+        ing_id = it["ingredientId"]
+        qty = float(it["qtyPer"])
+
+        ref = _ingredients_ref().document(ing_id)
+        snap = ref.get(transaction=tx)
+        if not snap.exists:
+            raise ValueError(f"Ингредиент '{ing_id}' отсутствует.")
+
+        data = snap.to_dict() or {}
+        cur = float(data.get("stock_quantity", 0))
+        if cur - qty < 0:
+            raise ValueError(f"Недостаточно '{ing_id}': есть {cur}, нужно {qty}.")
+        tx.update(ref, {"stock_quantity": cur - qty})
+
+    # записываем продажу
+    _sales_ref().document().set({
+        "product_id": product_id,
+        "ts": firestore.SERVER_TIMESTAMP,
+        "items": items,
+    })
 
 
-def _adjust_tx(transaction, ingredient_id: str, delta: float):
-    ref = _ingredients_ref().document(ingredient_id)
-    snap = ref.get(transaction=transaction)
-    cur = float((snap.to_dict() or {}).get("stock_quantity", 0.0))
-    new_val = cur + delta
-    if new_val < 0:
-        raise ValueError("Нельзя уйти в минус")
-    transaction.update(ref, {"stock_quantity": new_val})
-
-
-def adjust(ingredient_id: str, delta: float):
+def sell_product(product_id: str) -> Optional[str]:
     tx = db.transaction()
-    tx.run(lambda t: _adjust_tx(t, ingredient_id, delta))
-
-
-def sell_product(product_id: str) -> Tuple[bool, str]:
-    recipe = get_recipe(product_id)
-    if not recipe:
-        return False, "Нет рецепта для этой позиции"
-
     try:
-        deltas = [(it["ingredientId"], -float(it["qtyPer"])) for it in recipe]
-
-        def _tx(t):
-            for ing_id, d in deltas:
-                _adjust_tx(t, ing_id, d)
-
-        db.transaction().run(_tx)
-
-        db.collection("meta").document("lastSale").set({
-            "ts": firestore.SERVER_TIMESTAMP,
-            "productId": product_id,
-            "deltas": [{"ingredientId": a, "delta": b} for (a, b) in deltas],
-        })
-        return True, "Списано"
-    except ValueError as e:
-        return False, str(e)
+        tx.run(lambda t: _sell_tx(t, product_id))
+        return None
     except Exception as e:
-        return False, f"Ошибка: {e}"
+        return str(e)
 
 
-def undo_last_sale() -> Tuple[bool, str]:
-    doc = db.collection("meta").document("lastSale").get()
-    if not doc.exists:
-        return False, "Нет последней продажи"
-    data = doc.to_dict() or {}
-    deltas = data.get("deltas") or []
-    if not deltas:
-        return False, "Лог пуст"
-
+def undo_last_sale() -> Optional[str]:
     try:
-        def _tx(t):
-            for it in deltas:
-                _adjust_tx(t, it["ingredientId"], -float(it["delta"]))
+        q = _sales_ref().order_by("ts", direction=firestore.Query.DESCENDING).limit(1).stream()
+        last = None
+        for d in q:
+            last = d
+            break
+        if not last:
+            return "Продаж пока нет."
 
-        db.transaction().run(_tx)
-        db.collection("meta").document("lastSale").delete()
-        return True, "Последняя продажа отменена"
+        sale = last.to_dict() or {}
+        items: List[Dict[str, Any]] = sale.get("items", [])
+        # возвращаем
+        for it in items:
+            ing_id = it["ingredientId"]
+            qty = float(it["qtyPer"])
+            ref = _ingredients_ref().document(ing_id)
+            snap = ref.get()
+            cur = float((snap.to_dict() or {}).get("stock_quantity", 0))
+            ref.update({"stock_quantity": cur + qty})
+
+        last.reference.delete()
+        return None
     except Exception as e:
-        return False, f"Ошибка: {e}"
+        return str(e)
 
 
-# -------------------------
+def adjust_stock(ingredient_id: str, delta: float) -> Optional[str]:
+    try:
+        ref = _ingredients_ref().document(ingredient_id)
+        snap = ref.get()
+        if not snap.exists:
+            return f"Ингредиент '{ingredient_id}' не найден."
+        cur = float((snap.to_dict() or {}).get("stock_quantity", 0))
+        new_val = cur + delta
+        if new_val < 0:
+            return "Нельзя увести остаток в минус."
+        ref.update({"stock_quantity": new_val})
+        return None
+    except Exception as e:
+        return str(e)
+
+
+# -------------------------------
 # UI
-# -------------------------
+# -------------------------------
 st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
 st.title("☕ gipsy-office — учёт списаний")
 
+# Кнопка первичной инициализации
+with st.expander("⚙️ Первая настройка / создать стартовые данные"):
+    if st.button("Создать тестовые данные в Firestore"):
+        try:
+            # ingredients
+            _ingredients_ref().document("beans").set({
+                "name": "Зёрна",
+                "stock_quantity": 2000,
+                "unit": "g",
+                "capacity": 2000,
+                "reorder_threshold": 200,
+            }, merge=True)
+            _ingredients_ref().document("milk").set({
+                "name": "Молоко",
+                "stock_quantity": 5000,
+                "unit": "ml",
+                "capacity": 5000,
+                "reorder_threshold": 500,
+            }, merge=True)
+
+            # products
+            _products_ref().document("cappuccino").set({"name": "Капучино", "price": 250}, merge=True)
+            _products_ref().document("espresso").set({"name": "Эспрессо", "price": 150}, merge=True)
+
+            # recipes
+            _recipes_ref().document("cappuccino").set({
+                "items": [
+                    {"ingredientId": "beans", "qtyPer": 18},
+                    {"ingredientId": "milk", "qtyPer": 180},
+                ]
+            }, merge=True)
+            _recipes_ref().document("espresso").set({
+                "items": [
+                    {"ingredientId": "beans", "qtyPer": 18},
+                ]
+            }, merge=True)
+
+            st.success("Стартовые данные созданы. Перезагрузи страницу (или нажми R).")
+        except Exception as e:
+            st.error(f"Не удалось создать данные: {e.__class__.__name__}: {e}")
+
 tab1, tab2 = st.tabs(["Позиции", "Склад"])
 
+# -------------------------------
+# Позиции (продажи)
+# -------------------------------
 with tab1:
     prods = get_products()
     if not prods:
-        st.info("Добавьте документы в коллекцию `products`.")
+        st.info("Добавь продукты в коллекцию `products`, а рецепты — в `recipes`.")
     else:
-        c1, c2, c3 = st.columns([6, 2, 2])
-        c1.subheader("Позиция")
-        c2.subheader("Цена, ₽")
-        c3.subheader("Списать")
-
-        for p in prods:
-            name = p["name"]
-            price = p["price"]
-            r1, r2, r3 = st.columns([6, 2, 2])
-            r1.write(name)
-            r2.write(int(price) if float(price).is_integer() else price)
-            if r3.button("Списать", key=f"sell-{p['id']}"):
-                ok, msg = sell_product(p["id"])
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-                st.rerun()
+        cols = st.columns(3)
+        for i, p in enumerate(prods):
+            with cols[i % 3]:
+                st.subheader(p["name"])
+                st.caption(f'Цена: {int(p["price"])} ₽')
+                if st.button(f"Сделать {p['name']}", key=f"make_{p['id']}"):
+                    err = sell_product(p["id"])
+                    if err:
+                        st.error(f"Не продано: {err}")
+                    else:
+                        st.success("Списано по рецепту ✅")
+                        time.sleep(0.4)
+                        st.rerun()
 
     st.divider()
-    if st.button("Undo последней продажи"):
-        ok, msg = undo_last_sale()
-        (st.success if ok else st.error)(msg)
-        st.rerun()
+    if st.button("↩️ Undo последней продажи"):
+        err = undo_last_sale()
+        if err:
+            st.error(err)
+        else:
+            st.success("Откатили последнюю продажу.")
+            time.sleep(0.4)
+            st.rerun()
+
+# -------------------------------
+# Склад (остатки, статусы, корректировка)
+# -------------------------------
+def status_label(percent: float) -> str:
+    if percent >= 75:
+        return "🟢 Супер"
+    if percent >= 50:
+        return "🟡 Норм"
+    if percent >= 25:
+        return "🟠 Готовиться к закупке"
+    return "🔴 Срочно докупить"
 
 with tab2:
-    ing = get_ingredients()
-    if not ing:
-        st.info("Добавьте документы в коллекцию `ingredients`.")
+    ings = get_ingredients()
+    if not ings:
+        st.info("Нет ингредиентов. Создай стартовые данные (экспандер наверху).")
     else:
-        def steps_for_unit(u: str) -> List[Tuple[str, float]]:
-            if u == "g":
-                return [("+50 g", 50), ("+100 g", 100), ("-10 g", -10), ("-50 g", -50)]
-            return [("+50 ml", 50), ("+100 ml", 100), ("-10 ml", -10), ("-50 ml", -50)]
+        left_col, right_col = st.columns([2, 1])
 
-        lc, rc = st.columns([7, 5])
+        with left_col:
+            st.subheader("Склад")
+            for ing in ings:
+                cap = ing.get("capacity") or DEFAULT_CAPACITY.get(ing["id"], 0.0)
+                cur = float(ing["stock_quantity"])
+                unit = ing["unit"]
+                percent = (cur / cap * 100.0) if cap > 0 else 0.0
 
-        with lc:
-            st.subheader("Склад (операции)")
-            for item in ing:
-                st.markdown(
-                    f"**{item['id'].capitalize()}**  \n"
-                    f"{round(100 * item['stock_quantity'] / (item['capacity'] or 1)):d}%"
-                )
-                cols = st.columns(5)
-                for i, (label, d) in enumerate(steps_for_unit(item["unit"])):
-                    if cols[i].button(label, key=f"inc-{item['id']}-{label}"):
-                        try:
-                            adjust(item["id"], d)
-                            st.success("Ок")
-                        except Exception as e:
-                            st.error(str(e))
-                        st.rerun()
-                delta = cols[-1].number_input("±число", key=f"num-{item['id']}", value=0.0, step=10.0)
-                if st.button("Применить", key=f"apply-{item['id']}"):
-                    try:
-                        adjust(item["id"], float(delta))
-                        st.success("Ок")
-                    except Exception as e:
-                        st.error(str(e))
-                    st.rerun()
+                st.markdown(f"**{ing['name']}** — {percent:.0f}%")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                # быстрые кнопки
+                step_small = 10 if unit == "g" else 50
+                step_big = 100 if unit == "g" else 100
+
+                if c1.button(f"+{step_small} {unit}", key=f"plus_s_{ing['id']}"):
+                    err = adjust_stock(ing["id"], step_small)
+                    st.experimental_rerun() if not err else st.error(err)
+                if c2.button(f"+{step_big} {unit}", key=f"plus_b_{ing['id']}"):
+                    err = adjust_stock(ing["id"], step_big)
+                    st.experimental_rerun() if not err else st.error(err)
+                if c3.button(f"-{step_small} {unit}", key=f"minus_s_{ing['id']}"):
+                    err = adjust_stock(ing["id"], -step_small)
+                    st.experimental_rerun() if not err else st.error(err)
+                if c4.button(f"-{step_big} {unit}", key=f"minus_b_{ing['id']}"):
+                    err = adjust_stock(ing["id"], -step_big)
+                    st.experimental_rerun() if not err else st.error(err)
+
+                # ручное изменение
+                delta = c5.number_input("±число", value=0.0, step=1.0, key=f"delta_{ing['id']}")
+                if st.button("Применить", key=f"apply_{ing['id']}"):
+                    if delta != 0:
+                        err = adjust_stock(ing["id"], float(delta))
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("Изменено")
+                            time.sleep(0.4)
+                            st.rerun()
+
+                # справа показываем остаток/норму/статус
+                st.caption(f"Остаток: **{int(cur)} {unit}** / норма **{int(cap)} {unit}** — {status_label(percent)}")
                 st.write("")
 
-        with rc:
-            st.subheader("Состояние склада")
-            rows = []
-            for x in ing:
-                cap = x["capacity"] or 0.0
-                val = x["stock_quantity"]
-                status = human_status(val, cap) if cap > 0 else "Нет нормы"
-                rows.append({
-                    "Ингредиент": x["id"],
-                    "Остаток": f"{int(val) if float(val).is_integer() else round(val, 1)} {x['unit']}",
-                    "Норма": f"{int(cap)} {x['unit']}" if cap else "—",
-                    "Статус": status,
-                    "Процент": round(100 * val / cap) if cap else 0,
-                })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, hide_index=True, use_container_width=True)
+        with right_col:
+            st.subheader("Экспорт списков")
+            low25 = []
+            low50 = []
+            for ing in ings:
+                cap = ing.get("capacity") or DEFAULT_CAPACITY.get(ing["id"], 0.0)
+                cur = float(ing["stock_quantity"])
+                p = (cur / cap * 100.0) if cap > 0 else 0.0
+                if p < 25:
+                    low25.append(f"{ing['name']}: осталось {int(cur)} / {int(cap)}")
+                elif p < 50:
+                    low50.append(f"{ing['name']}: осталось {int(cur)} / {int(cap)}")
 
-            st.write("")
-            def low_df(th: float) -> pd.DataFrame:
-                data = []
-                for x in ing:
-                    cap = x["capacity"] or 0
-                    if cap <= 0:
-                        continue
-                    if (x["stock_quantity"] / cap) < th:
-                        data.append({
-                            "Ингредиент": x["id"],
-                            "Остаток": int(x["stock_quantity"]) if float(x["stock_quantity"]).is_integer() else round(x["stock_quantity"], 1),
-                            "Норма": int(cap),
-                            "Ед.": x["unit"],
-                            "Процент": int(round(100 * x["stock_quantity"] / cap)),
-                        })
-                return pd.DataFrame(data)
-
-            c25, c50 = st.columns(2)
-            df25 = low_df(0.25)
-            df50 = low_df(0.50)
-            c25.download_button(
-                "Экспорт <25%",
-                data=df25.to_csv(index=False).encode("utf-8"),
-                file_name=f"need_to_buy_under_25_{int(time.time())}.csv",
-                mime="text/csv",
-            )
-            c50.download_button(
-                "Экспорт <50%",
-                data=df50.to_csv(index=False).encode("utf-8"),
-                file_name=f"need_to_buy_under_50_{int(time.time())}.csv",
-                mime="text/csv",
-            )
+            if st.button("Экспорт <25%"):
+                if not low25:
+                    st.info("Все позиции ≥ 25% 👍")
+                else:
+                    st.code("\n".join(low25))
+            if st.button("Экспорт <50%"):
+                if not low50:
+                    st.info("Все позиции ≥ 50% 👍")
+                else:
+                    st.code("\n".join(low50))
