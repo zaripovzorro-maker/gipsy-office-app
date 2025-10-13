@@ -1,3 +1,4 @@
+# streamlit_app.py
 import json
 import time
 from typing import Optional
@@ -5,29 +6,40 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from firebase_admin import credentials, initialize_app
+import firebase_admin
+from firebase_admin import credentials
 from google.cloud import firestore
 
-# ---------- Firestore init ----------
-def init_firestore():
-    if not initialize_app._apps:
-        svc_raw = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
-        if not svc_raw:
-            st.error("В секрете нет FIREBASE_SERVICE_ACCOUNT")
-            st.stop()
+# =========================
+#  Firestore init
+# =========================
+def init_firestore() -> firestore.Client:
+    svc_raw = (st.secrets.get("FIREBASE_SERVICE_ACCOUNT") or "").strip()
+    if not svc_raw:
+        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой меню ⋮ → Edit secrets и вставь JSON ключ.")
+        st.stop()
+
+    # Инициализируем firebase_admin ровно один раз
+    if not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(svc_raw))
-        initialize_app(cred)
-    return firestore.Client(project=st.secrets.get("PROJECT_ID", None))
+        firebase_admin.initialize_app(cred)
+
+    project_id = st.secrets.get("PROJECT_ID")
+    return firestore.Client(project=project_id)
 
 db = init_firestore()
 
-# ---------- доменные функции ----------
+# =========================
+#  Бизнес-логика
+# =========================
+# Нормы для процентов по умолчанию (можно менять)
 DEFAULT_CAPACITY = {"beans": 2000, "milk": 5000}
 
 def capacity_for(ing: dict) -> float:
+    # из поля capacity, иначе из дефолтов
     return float(ing.get("capacity") or DEFAULT_CAPACITY.get(ing["id"]) or 0)
 
-def percent(ing: dict) -> Optional[float]:
+def calc_percent(ing: dict) -> Optional[float]:
     cap = capacity_for(ing)
     if cap <= 0:
         return None
@@ -45,17 +57,19 @@ def status_label(p: Optional[float]) -> tuple[str, str]:
     return ("Срочно докупить", "crimson")
 
 def get_products():
-    return [{"id": d.id, **(d.to_dict() or {})} for d in db.collection("products").stream()]
+    col = db.collection("products").stream()
+    return [{"id": d.id, **(d.to_dict() or {})} for d in col]
 
 def get_ingredients():
-    items = [{"id": d.id, **(d.to_dict() or {})} for d in db.collection("ingredients").stream()]
+    col = db.collection("ingredients").stream()
+    items = [{"id": d.id, **(d.to_dict() or {})} for d in col]
     for it in items:
         it["stock_quantity"] = float(it.get("stock_quantity", 0))
         it["reorder_threshold"] = float(it.get("reorder_threshold", 0))
     items.sort(key=lambda x: x.get("name", ""))
     return items
 
-# ---- транзакции ----
+# ---------- транзакции ----------
 @firestore.transactional
 def _adjust_tx(transaction, ingredient_id: str, delta: float):
     ref = db.collection("ingredients").document(ingredient_id)
@@ -78,9 +92,9 @@ def _sell_tx(transaction, product_id: str, qty: int):
     rsnap = rref.get(transaction=transaction)
     if not rsnap.exists:
         raise ValueError("Рецепт не найден")
-    items = rsnap.to_dict().get("items") or []
+    items = (rsnap.to_dict() or {}).get("items") or []
 
-    batch = []
+    plan = []
     for it in items:
         ing_ref = db.collection("ingredients").document(it["ingredientId"])
         ing_snap = ing_ref.get(transaction=transaction)
@@ -91,9 +105,9 @@ def _sell_tx(transaction, product_id: str, qty: int):
         if stock < need:
             name = ing_snap.to_dict().get("name", it["ingredientId"])
             raise ValueError(f"{name}: нужно {need}, есть {stock}")
-        batch.append((ing_ref, stock, need))
+        plan.append((ing_ref, stock, need))
 
-    for ing_ref, stock, need in batch:
+    for ing_ref, stock, need in plan:
         transaction.update(ing_ref, {"stock_quantity": stock - need})
 
     sref = db.collection("sales").document()
@@ -139,6 +153,7 @@ def _undo_tx(transaction, sale_id: str):
         stock = float(ing_snap.to_dict().get("stock_quantity", 0))
         back = float(it["qtyPer"]) * qty
         transaction.update(ing_ref, {"stock_quantity": stock + back})
+
     transaction.update(sref, {"undone": True, "undoneAt": firestore.SERVER_TIMESTAMP})
 
 def undo_last():
@@ -148,21 +163,25 @@ def undo_last():
     tx = db.transaction()
     _undo_tx(tx, s["id"])
 
-# ---------- UI ----------
+# =========================
+#  UI
+# =========================
 st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
 st.title("☕ gipsy-office — учёт списаний")
 
 tab1, tab2 = st.tabs(["Позиции", "Склад"])
 
+# --- Позиции ---
 with tab1:
-    prods = get_products()
+    products = get_products()
     cols = st.columns(3)
-    if not prods:
-        st.info("Добавь документы в коллекцию `products`.")
+    if not products:
+        st.info("Добавь документы в коллекцию `products` (name, price).")
     else:
-        for i, p in enumerate(prods):
+        for i, p in enumerate(products):
             with cols[i % 3]:
-                if st.button(f"{p.get('name','?')}  •  {p.get('price','')} ₽", key=f"sell-{p['id']}"):
+                label = f"{p.get('name','?')} • {p.get('price','')} ₽"
+                if st.button(label, key=f"sell-{p['id']}"):
                     try:
                         sid = sell(p["id"], 1)
                         st.success(f"Продано: {p.get('name','?')} (saleId: {sid})")
@@ -170,6 +189,7 @@ with tab1:
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
+
     st.divider()
     if st.button("Undo последней продажи"):
         try:
@@ -180,45 +200,57 @@ with tab1:
         except Exception as e:
             st.error(str(e))
 
+# --- Склад ---
 with tab2:
     ings = get_ingredients()
+
+    # быстрые экспорт-кнопки
     rows = []
     for ing in ings:
-        pct = percent(ing)
-        label, color = status_label(pct)
+        p = calc_percent(ing)
+        label, _ = status_label(p)
         rows.append({
-            "id": ing["id"], "name": ing.get("name",""), "unit": ing.get("unit",""),
-            "stock": ing.get("stock_quantity",0), "capacity": capacity_for(ing) or "",
-            "percent": None if pct is None else round(pct), "status": label
+            "id": ing["id"],
+            "name": ing.get("name",""),
+            "unit": ing.get("unit",""),
+            "stock": ing.get("stock_quantity",0),
+            "capacity": capacity_for(ing) or "",
+            "percent": None if p is None else round(p),
+            "status": label,
         })
 
     c1, c2, _ = st.columns([1,1,4])
     if c1.button("Экспорт <50%"):
         df = pd.DataFrame([r for r in rows if (r["percent"] is not None and r["percent"] < 50)])
-        st.download_button("Скачать CSV (<50%)", df.to_csv(index=False).encode("utf-8"),
-                           "under_50.csv", "text/csv") if not df.empty else st.info("Нет позиций < 50%")
+        if df.empty:
+            st.info("Нет позиций < 50%")
+        else:
+            st.download_button("Скачать CSV (<50%)", df.to_csv(index=False).encode("utf-8"),
+                               "under_50.csv", "text/csv")
     if c2.button("Экспорт <25%"):
         df = pd.DataFrame([r for r in rows if (r["percent"] is not None and r["percent"] < 25)])
-        st.download_button("Скачать CSV (<25%)", df.to_csv(index=False).encode("utf-8"),
-                           "under_25.csv", "text/csv") if not df.empty else st.info("Нет позиций < 25%")
+        if df.empty:
+            st.info("Нет позиций < 25%")
+        else:
+            st.download_button("Скачать CSV (<25%)", df.to_csv(index=False).encode("utf-8"),
+                               "under_25.csv", "text/csv")
 
     st.write("")
     for ing in ings:
-        pct = percent(ing)
-        label, color = status_label(pct)
+        p = calc_percent(ing)
+        label, color = status_label(p)
         with st.container(border=True):
             a, b, c = st.columns([2,4,3])
             with a:
                 st.subheader(ing.get("name",""))
             with b:
-                st.progress(int(pct or 0), text=f"{'' if pct is None else int(pct)}% • {label}")
+                st.progress(int(p or 0), text=f"{'' if p is None else int(p)}% • {label}")
             with c:
                 cap = capacity_for(ing)
-                st.markdown(
-                    f"**Остаток:** {int(ing['stock_quantity'])} {ing['unit']} / "
-                    f"норма {int(cap)} {ing['unit']}" if cap else
-                    f"**Остаток:** {int(ing['stock_quantity'])} {ing['unit']} / норма не задана"
-                )
+                if cap:
+                    st.markdown(f"**Остаток:** {int(ing['stock_quantity'])} {ing['unit']} / норма {int(cap)} {ing['unit']}")
+                else:
+                    st.markdown(f"**Остаток:** {int(ing['stock_quantity'])} {ing['unit']} / норма не задана")
 
             c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,2,2])
             if c1.button(f"+50 {ing['unit']}", key=f"p50-{ing['id']}"):
