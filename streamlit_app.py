@@ -11,7 +11,7 @@ def init_firestore() -> firestore.Client:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    if isinstance(svc, dict):         # ✅ теперь читаем как словарь
+    if isinstance(svc, dict):
         data = svc
     else:
         text = str(svc).strip()
