@@ -1,5 +1,7 @@
 # streamlit_app.py — Gipsy Office (Streamlit + Firestore)
 
+from collections.abc import Mapping
+
 from __future__ import annotations
 
 import json
@@ -35,8 +37,8 @@ def init_firestore() -> firestore.Client:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    if isinstance(svc, dict):
-        data = dict(svc)  # TOML-таблица — это dict
+    if isinstance(svc, Mapping):  # поймает AttrDict
+    data = dict(svc)  # TOML-таблица — это dict
     elif isinstance(svc, str):
         s = svc.strip()
         if not s.startswith("{"):
