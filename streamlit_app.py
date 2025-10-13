@@ -1,4 +1,3 @@
-# streamlit_app.py
 import json
 import time
 from typing import Optional
@@ -10,16 +9,14 @@ import firebase_admin
 from firebase_admin import credentials
 from google.cloud import firestore
 
-# =========================
-#  Firestore init
-# =========================
+# --- Firestore init ---
 def init_firestore() -> firestore.Client:
     svc_raw = (st.secrets.get("FIREBASE_SERVICE_ACCOUNT") or "").strip()
     if not svc_raw:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой меню ⋮ → Edit secrets и вставь JSON ключ.")
         st.stop()
 
-    # Инициализируем firebase_admin ровно один раз
+    # ВАЖНО: проверяем именно firebase_admin._apps
     if not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(svc_raw))
         firebase_admin.initialize_app(cred)
