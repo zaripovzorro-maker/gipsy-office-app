@@ -1,5 +1,6 @@
 # streamlit_app.py
 # gipsy office — POS для бариста (категории → напитки → объём → корзина → покупка)
+# Полная версия с надёжной инициализацией Firestore (поддержка TOML/JSON в secrets)
 
 from __future__ import annotations
 
@@ -8,22 +9,20 @@ from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 import streamlit as st
-
-# Firebase / Firestore
-import firebase_admin
-from firebase_admin import credentials
 from google.cloud import firestore
+from google.oauth2 import service_account
 
 
-# =========================
-# Инициализация Firestore
-# =========================
+# ========== надежная инициализация Firestore ==========
 def init_firestore() -> firestore.Client:
-    import json, os
+    """
+    Инициализируем Firestore, читая из st.secrets:
+      - PROJECT_ID: строка
+      - FIREBASE_SERVICE_ACCOUNT: либо таблица TOML, либо JSON-строка (в одной строке)
+    Функция сама нормализует private_key (\n -> реальные переводы) и показывает диагностику в сайдбаре.
+    """
     from collections.abc import Mapping
-    import streamlit as st
-    from google.oauth2 import service_account
-    from google.cloud import firestore
+    import os
 
     project_id = (st.secrets.get("PROJECT_ID") or os.getenv("PROJECT_ID") or "").strip()
     svc_raw = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
@@ -54,36 +53,33 @@ def init_firestore() -> firestore.Client:
         st.error("❌ FIREBASE_SERVICE_ACCOUNT должен быть таблицей TOML или JSON-строкой.")
         st.stop()
 
-    # Валидация ключевых полей
-    required_keys = ["type", "project_id", "private_key_id", "private_key", "client_email", "token_uri"]
-    missing = [k for k in required_keys if not data.get(k)]
+    # Проверка ключевых полей
+    required = ["type", "project_id", "private_key_id", "private_key", "client_email", "token_uri"]
+    missing = [k for k in required if not data.get(k)]
     if missing:
         st.error(f"❌ В service account отсутствуют поля: {', '.join(missing)}. "
                  "Скопируй JSON из Firebase консоли без изменений.")
         st.stop()
 
-    # Нормализация приватного ключа
-    pk = data.get("private_key", "")
-    # Если ключ пришёл с литералами \r\n или \\n — превращаем в реальные переводы строк
+    # Нормализация приватного ключа: превращаем литералы \n в реальные переводы
+    pk = str(data.get("private_key", "")).strip()
     if "\\n" in pk and "\n" not in pk:
         pk = pk.replace("\\r\\n", "\n").replace("\\n", "\n")
-    # Убираем возможные лишние пробелы по краям
-    pk = pk.strip()
     data["private_key"] = pk
 
-    # Доп. диагностика по ключу (без вывода содержимого)
+    # Доп. диагностика по ключу (без утечки содержимого)
     st.sidebar.write(f"- private_key length: {len(pk)}")
     st.sidebar.write(f"- starts with BEGIN: {pk.startswith('-----BEGIN PRIVATE KEY-----')}")
     st.sidebar.write(f"- contains newline: {('\\n' in pk) or (chr(10) in pk)}")
 
-    # Пробуем создать креды
+    # Создаём креды и клиент
     try:
         creds = service_account.Credentials.from_service_account_info(data)
     except Exception as e:
-        st.error("❌ Не удалось обработать service account. Чаще всего это из-за поломанного private_key "
-                 "(попали лишние символы/кавычки). "
-                 "Ещё раз скопируй JSON из Firebase и вставь в Secrets ровно как есть "
-                 "(для JSON — одной строкой с \\n; для TOML — многострочно без \\n).")
+        st.error("❌ Не удалось обработать сервисный ключ. Чаще всего это из-за поломанного private_key "
+                 "(лишние символы/кавычки). "
+                 "JSON-вариант: одна строка и внутри ключа должны быть \\n. "
+                 "TOML-вариант: многострочно, без \\n внутри.")
         st.stop()
 
     try:
@@ -91,6 +87,7 @@ def init_firestore() -> firestore.Client:
     except Exception as e:
         st.error(f"❌ Firestore client init failed: {e}")
         st.stop()
+
 
 db: firestore.Client = init_firestore()
 
@@ -288,7 +285,7 @@ def clear_cart():
 # =========================
 # Списание при покупке
 # =========================
-def commit_sale(cart: List[Dict]) -> Tuple[bool, str]:
+def commit_sale(cart: List[Dict]) -> tuple[bool, str]:
     """Проверяет остатки, если хватает — списывает и создаёт документ в sales."""
     if not cart:
         return False, "Корзина пуста."
@@ -351,7 +348,7 @@ def commit_sale(cart: List[Dict]) -> Tuple[bool, str]:
         tx.set(db.collection("sales").document(), sale_doc)
 
     try:
-        db.transaction()( _tx_func )
+        db.transaction()(_tx_func)
         return True, "Готово! Продажа проведена."
     except Exception as e:
         return False, f"Ошибка транзакции: {e}"
@@ -360,6 +357,7 @@ def commit_sale(cart: List[Dict]) -> Tuple[bool, str]:
 # =========================
 # UI — Шапка
 # =========================
+st.set_page_config(page_title="gipsy office — продажи", page_icon="☕", layout="wide")
 st.title("☕ gipsy office — продажи")
 
 # заметка
@@ -439,7 +437,6 @@ with left:
             st.session_state["selected_size"] = "M"
             st.session_state["qty"] = 1
 
-    
     st.markdown("---")
 
     # --- Параметры выбранного напитка ---
@@ -454,7 +451,7 @@ with left:
         sizes_map = prod.get("sizes", {})
 
         size_cols = st.columns(6)
-        for lbl, vol_mult, price_mult in SIZE_PRESETS:
+        for idx, (lbl, vol_mult, price_mult) in enumerate(SIZE_PRESETS):
             if lbl in sizes_map:
                 price_lbl = int(sizes_map[lbl])
             else:
@@ -465,9 +462,7 @@ with left:
               <b>{lbl}</b>&nbsp;&nbsp;—&nbsp;{price_lbl} ₽
             </span>
             """
-            if size_cols[SIZE_PRESETS.index((lbl, vol_mult, price_mult)) % 6].button(
-                html_btn, key=f"size_{lbl}"
-            ):
+            if size_cols[idx % 6].button(html_btn, key=f"size_{lbl}"):
                 st.session_state["selected_size"] = lbl
 
         # qty
