@@ -14,12 +14,12 @@ from firebase_admin import credentials
 
 def _read_firebase_service_account() -> Dict:
     """
-    Поддерживает два формата Secrets:
+    Поддерживает два формата в Streamlit Secrets:
       A) TOML-таблица:
          [FIREBASE_SERVICE_ACCOUNT]
          type="service_account"
-         ...
-         private_key = """-----BEGIN... (с реальными переводами строк) ... END-----"""
+         project_id="..."
+         private_key="""-----BEGIN PRIVATE KEY----- (многострочно, без \n) -----END PRIVATE KEY-----"""
       B) JSON-строка:
          FIREBASE_SERVICE_ACCOUNT = "{\"type\":\"service_account\",...,\"private_key\":\"-----BEGIN...\\n...\\nEND-----\\n\"}"
     """
@@ -28,24 +28,25 @@ def _read_firebase_service_account() -> Dict:
 
     svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
 
-    # Вариант B: JSON-строка
+    # JSON-строка
     if isinstance(svc, str):
         try:
             data = json.loads(svc)
         except Exception:
-            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой (валидный JSON) или таблицей TOML.")
-        # если в ключе литералы \n — превращаем в реальные переводы строк
+            raise RuntimeError(
+                "FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой (валидный JSON) или таблицей TOML."
+            )
         pk = data.get("private_key", "")
+        # если внутри JSON ключа встречаются литералы \n — заменяем на реальные переводы
         if "\\n" in pk and "\n" not in pk:
             data["private_key"] = pk.replace("\\n", "\n")
         return data
 
-    # Вариант A: таблица TOML (dict)
+    # TOML-таблица (dict)
     if isinstance(svc, dict):
         data = dict(svc)
         pk = data.get("private_key", "")
-        # Для TOML всё должно уже быть многострочно — НИЧЕГО не меняем.
-        # Лёгкая валидация шапки:
+        # ничего не трогаем, просто проверяем
         if not str(pk).startswith("-----BEGIN PRIVATE KEY-----"):
             raise RuntimeError("private_key (TOML) должен начинаться с -----BEGIN PRIVATE KEY-----")
         return data
