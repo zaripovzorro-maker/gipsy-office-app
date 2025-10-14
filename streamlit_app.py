@@ -410,7 +410,6 @@ with left:
         # размеры
         st.markdown("**Объём / размер**")
 
-        
         # если у продукта есть map sizes — показываем цены оттуда
         sizes_map = prod.get("sizes", {})
 
