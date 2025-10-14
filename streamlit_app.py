@@ -28,7 +28,6 @@ def _read_firebase_service_account() -> Dict:
         [FIREBASE_SERVICE_ACCOUNT]
         type = "service_account"
         project_id = "gipsy-office"
-        private_key = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
         ...
 
     2) JSON-строка, целиком:
