@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# gipsy-office — учёт товаров (Streamlit + Firestore, google-auth creds)
+# gipsy-office — учёт товаров (Streamlit + Firestore, google-auth creds + цветной UI + поставки)
 
 import os
 import json
@@ -26,11 +26,6 @@ def init_firestore() -> firestore.Client:
     project_id = (st.secrets.get("PROJECT_ID") or os.getenv("PROJECT_ID") or "").strip()
     svc_raw: Any = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
 
-    # Диагностика (без утечек)
-    st.sidebar.write("🔍 Secrets:")
-    st.sidebar.write(f"- PROJECT_ID: {project_id or '❌ нет'}")
-    st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc_raw).__name__}")
-
     if not project_id:
         st.error('❌ В secrets нет PROJECT_ID. Добавь строку: PROJECT_ID = "gipsy-office"')
         st.stop()
@@ -38,7 +33,6 @@ def init_firestore() -> firestore.Client:
         st.error("❌ В secrets нет FIREBASE_SERVICE_ACCOUNT (таблица TOML или JSON-строка).")
         st.stop()
 
-    # Превращаем в dict (поддерживаем AttrDict, dict, str(JSON))
     if isinstance(svc_raw, Mapping):
         svc = dict(svc_raw)
     elif isinstance(svc_raw, str):
@@ -51,21 +45,15 @@ def init_firestore() -> firestore.Client:
         st.error(f"❌ FIREBASE_SERVICE_ACCOUNT должен быть mapping или JSON-строкой, получено: {type(svc_raw).__name__}")
         st.stop()
 
-    # Быстрые флаги
-    st.sidebar.write(f"- has private_key: {bool(svc.get('private_key'))}")
-    st.sidebar.write(f"- sa project_id: {svc.get('project_id', '—')}")
-
-    # Создаём google-auth креды из service account info
     try:
         creds = service_account.Credentials.from_service_account_info(svc)
         db = firestore.Client(project=project_id, credentials=creds)
         return db
     except Exception as e:
         st.error(f"❌ Не удалось создать Firestore client: {e}")
-        st.info("Проверь формат секрета: [FIREBASE_SERVICE_ACCOUNT] с многострочным private_key в тройных кавычках и PROJECT_ID снаружи.")
+        st.info("Проверь формат секрета: [FIREBASE_SERVICE_ACCOUNT] с многострочным private_key и PROJECT_ID снаружи.")
         st.stop()
 
-# Глобальный клиент БД
 db = init_firestore()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -82,6 +70,9 @@ def _recipes_ref():
 
 def _sales_ref():
     return db.collection("sales")
+
+def _deliveries_ref():
+    return db.collection("deliveries")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Утилиты
@@ -189,7 +180,6 @@ def sell_product(product_id: str) -> Optional[str]:
         recipe = get_recipe(product_id)
         if not recipe:
             return "Нет рецепта для этой позиции."
-        # проверяем достаточность и списываем
         for it in recipe:
             err = adjust_stock(it["ingredientId"], -float(it["qtyPer"]))
             if err:
@@ -217,12 +207,41 @@ def undo_last_sale() -> Optional[str]:
     except Exception as e:
         return str(e)
 
+# ───────────── Поставки ─────────────
+def register_delivery(ingredient_id: str, qty: float, supplier: str, note: str) -> Optional[str]:
+    """Записывает поставку и увеличивает остаток."""
+    try:
+        now = firestore.SERVER_TIMESTAMP
+        _deliveries_ref().document().set({
+            "ingredientId": ingredient_id,
+            "qty": float(qty),
+            "supplier": supplier.strip(),
+            "note": note.strip(),
+            "ts": now,
+        })
+        return adjust_stock(ingredient_id, float(qty))
+    except Exception as e:
+        return str(e)
+
+def get_deliveries_between(dt_from: datetime, dt_to: datetime) -> List[Dict[str, Any]]:
+    dt_from_utc = dt_from.astimezone(timezone.utc)
+    dt_to_utc = dt_to.astimezone(timezone.utc)
+    q = (_deliveries_ref()
+         .where("ts", ">=", dt_from_utc)
+         .where("ts", "<", dt_to_utc)
+         .order_by("ts"))
+    docs = q.stream()
+    out: List[Dict[str, Any]] = []
+    for d in docs:
+        row = d.to_dict() or {}
+        row["id"] = d.id
+        out.append(row)
+    return out
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Отчёты
+# Отчёты (продажи)
 # ──────────────────────────────────────────────────────────────────────────────
 def get_sales_between(dt_from: datetime, dt_to: datetime) -> List[Dict[str, Any]]:
-    # Firestore хранит ts как Timestamp (UTC). Будем фильтровать диапазоном.
-    # Приведём границы к UTC.
     dt_from_utc = dt_from.astimezone(timezone.utc)
     dt_to_utc = dt_to.astimezone(timezone.utc)
     q = (_sales_ref()
@@ -238,7 +257,6 @@ def get_sales_between(dt_from: datetime, dt_to: datetime) -> List[Dict[str, Any]
     return out
 
 def aggregate_sales(sales: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # По продуктам и по ингредиентам
     by_product: Dict[str, int] = {}
     by_ingredient: Dict[str, float] = {}
     for s in sales:
@@ -248,18 +266,99 @@ def aggregate_sales(sales: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataF
             ing = it.get("ingredientId")
             qty = float(it.get("qtyPer", 0))
             by_ingredient[ing] = by_ingredient.get(ing, 0.0) + qty
-
     df_prod = pd.DataFrame([{"product_id": k, "count": v} for k, v in by_product.items()]).sort_values("count", ascending=False) if by_product else pd.DataFrame(columns=["product_id", "count"])
     df_ing = pd.DataFrame([{"ingredient_id": k, "qty": v} for k, v in by_ingredient.items()]).sort_values("qty", ascending=False) if by_ingredient else pd.DataFrame(columns=["ingredient_id", "qty"])
     return df_prod, df_ing
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI
+# UI — Настройки страницы + стили
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
+
+# Цветной «тёплый» UI: крупные кнопки, карточки, сетка
+st.markdown("""
+<style>
+:root {
+  --go-primary: #6C47FF;   /* фиолетовый акцент */
+  --go-green:  #22c55e;
+  --go-amber:  #f59e0b;
+  --go-red:    #ef4444;
+  --go-bg:     #0b0b0c;
+  --go-card:   #151518;
+  --go-border: rgba(255,255,255,0.08);
+  --go-text:   #f2f2f3;
+  --go-sub:    #b7b7c0;
+}
+html, body, [data-testid="stAppViewContainer"] { background: var(--go-bg) !important; color: var(--go-text) !important;}
+h1,h2,h3,h4 { color: var(--go-text) !important; }
+hr { border-color: var(--go-border) !important; }
+
+.stButton>button {
+  width: 100%;
+  border-radius: 14px;
+  padding: 14px 16px;
+  font-weight: 700;
+  border: 1px solid var(--go-border);
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+  color: var(--go-text);
+}
+.stButton>button:hover { border-color: rgba(255,255,255,0.18); }
+
+.go-card {
+  border: 1px solid var(--go-border);
+  border-radius: 16px;
+  padding: 12px 14px;
+  background: var(--go-card);
+  margin-bottom: 10px;
+}
+
+.go-pill {
+  display:inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border:1px solid var(--go-border);
+  color: var(--go-sub);
+}
+
+.go-grid {
+  display:grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+@media (max-width: 900px) {
+  .go-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 600px) {
+  .go-grid { grid-template-columns: 1fr; }
+}
+
+/* Кнопки позиций — большие цветные */
+.go-tile button {
+  height: 90px;
+  font-size: 20px;
+  background: linear-gradient(180deg, rgba(108,71,255,0.25), rgba(108,71,255,0.08)) !important;
+  border: 1px solid rgba(108,71,255,0.45) !important;
+}
+.go-tile .sub { font-size: 12px; opacity: .85}
+
+.go-tile.active button {
+  background: linear-gradient(180deg, rgba(34,197,94,0.28), rgba(34,197,94,0.08)) !important;
+  border: 1px solid rgba(34,197,94,0.55) !important;
+}
+
+/* Таблицы */
+[data-testid="stDataFrame"] { background: var(--go-card) !important; border-radius: 12px; }
+/* Инпуты */
+input, textarea, select { background: #121214 !important; color: var(--go-text) !important; border-radius: 8px !important; border:1px solid var(--go-border) !important;}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("☕ gipsy-office — учёт списаний")
 
-# Первая настройка
+# ──────────────────────────────────────────────────────────────────────────────
+# Первая настройка (демо-данные)
+# ──────────────────────────────────────────────────────────────────────────────
 with st.expander("⚙️ Первая настройка / создать тестовые данные"):
     if st.button("Создать тестовые данные"):
         try:
@@ -279,46 +378,33 @@ with st.expander("⚙️ Первая настройка / создать тес
             st.error(f"Ошибка создания: {e}")
 
 # вкладки
-tab1, tab2, tab3, tab4 = st.tabs(["Позиции", "Склад", "Рецепты", "Отчёты"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Позиции", "Склад", "Рецепты", "Отчёты", "Поставки"])
 
-# --- Позиции (с подсветкой последней нажатой и составом) ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Позиции (быстрые большие плитки + состав + подсветка последнего клика)
+# ──────────────────────────────────────────────────────────────────────────────
 with tab1:
-    # бейдж наверху — что списали только что
     last_sale_name = st.session_state.get("last_sale_name")
     last_sale_id = st.session_state.get("last_sale_id")
     if last_sale_name:
-        st.success(f"Списано: {last_sale_name}", icon="✅")
+        st.markdown(f'<span class="go-pill">Списано: {last_sale_name}</span>', unsafe_allow_html=True)
+        st.write("")
 
     prods = get_products()
+    ing_map = get_ingredients_map()
     if not prods:
         st.info("Добавь продукты в Firestore.")
     else:
-        ing_map = get_ingredients_map()
+        # сетка плиток
+        st.markdown('<div class="go-grid">', unsafe_allow_html=True)
         for p in prods:
             recipe = get_recipe(p["id"])
-            # контейнер с рамкой, если это последняя нажатая позиция
             is_last = (p["id"] == last_sale_id)
-            border = "2px solid #22c55e" if is_last else "1px solid rgba(0,0,0,0.08)"
-            bg = "rgba(34,197,94,0.06)" if is_last else "rgba(0,0,0,0.02)"
-            st.markdown(
-                f"""
-                <div style="border:{border};background:{bg};border-radius:12px;padding:10px;margin-bottom:8px;">
-                """,
-                unsafe_allow_html=True
-            )
-            c1, c2, c3 = st.columns([5, 2, 2])
-            c1.write(f"**{p['name']}**" + ("  🟩" if is_last else ""))
-            c2.write(f"{int(p['price'])} ₽")
-
-            # состав
-            if recipe:
-                lines = [format_recipe_line(it, ing_map) for it in recipe]
-                c1.caption("Состав:\n" + "\n".join(lines))
-            else:
-                c1.caption("Состав не задан")
-
-            # кнопка списания
-            if c3.button("Списать", key=f"sell_{p['id']}"):
+            tile_class = "go-tile active" if is_last else "go-tile"
+            st.markdown(f'<div class="go-card {tile_class}">', unsafe_allow_html=True)
+            # Крупная кнопка
+            col_btn = st.columns(1)[0]
+            if col_btn.button(f"{p['name']} — {int(p['price'])} ₽", key=f"sell_tile_{p['id']}"):
                 err = sell_product(p["id"])
                 if err:
                     st.error(err)
@@ -326,10 +412,16 @@ with tab1:
                     st.session_state["last_sale_name"] = p["name"]
                     st.session_state["last_sale_id"] = p["id"]
                     st.rerun()
+            # Состав мелким шрифтом
+            if recipe:
+                lines = [format_recipe_line(it, ing_map) for it in recipe]
+                st.markdown(f'<div class="sub" style="margin-top:6px; color: var(--go-sub)">{ "<br/>".join(lines) }</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="sub" style="margin-top:6px; color: var(--go-sub)">Состав не задан</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.divider()
+        st.write("")
         if st.button("↩️ Undo последней продажи"):
             err = undo_last_sale()
             if err:
@@ -340,7 +432,9 @@ with tab1:
                 st.session_state["last_sale_id"] = None
                 st.rerun()
 
-# --- Склад ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Склад
+# ──────────────────────────────────────────────────────────────────────────────
 with tab2:
     ings = get_ingredients()
     if not ings:
@@ -353,7 +447,13 @@ with tab2:
                 cur = i["stock_quantity"]
                 cap = i["capacity"] or DEFAULT_CAPACITY.get(i["id"], 1)
                 pct = percent(cur, cap)
-                st.markdown(f"**{i['name']}** — {pct}% ({int(cur)} / {int(cap)} {i['unit']}) — {status_label(pct)}")
+                st.markdown(f"""
+                <div class="go-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div><b>{i['name']}</b> — {pct}% ({int(cur)} / {int(cap)} {i['unit']})</div>
+                      <span class="go-pill">{status_label(pct)}</span>
+                    </div>
+                """, unsafe_allow_html=True)
                 c1, c2, c3, c4, c5 = st.columns(5)
                 step_small = 10 if i["unit"] == "g" else 50
                 step_big   = 100 if i["unit"] == "g" else 100
@@ -367,7 +467,7 @@ with tab2:
                         err = adjust_stock(i["id"], float(delta))
                         if err: st.error(err)
                         else: st.success("Готово"); st.rerun()
-                st.write("")
+                st.markdown("</div>", unsafe_allow_html=True)
         with right:
             st.subheader("📉 Недостачи")
             low25 = []
@@ -385,7 +485,9 @@ with tab2:
             if st.button("Показать список <50%"):
                 st.code("\n".join(low50) or "Все позиции ≥ 50% 👍")
 
-# --- Рецепты (редактор + цена + дубликатор) ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Рецепты (редактор + цена + дубликатор)
+# ──────────────────────────────────────────────────────────────────────────────
 with tab3:
     prods = get_products()
     ing_map = get_ingredients_map()
@@ -424,7 +526,6 @@ with tab3:
 
                 cur_recipe = get_recipe(p["id"])
 
-                # таблица текущих позиций с возможностью изменить qty или удалить
                 st.markdown("**Текущий состав:**")
                 if cur_recipe:
                     for idx, it in enumerate(cur_recipe):
@@ -434,13 +535,11 @@ with tab3:
                         cols = st.columns([5, 3, 2, 2])
                         cols[0].write(meta["name"])
                         new_qty = cols[1].number_input("qty", key=f"qty_{p['id']}_{idx}", value=qty, step=1.0)
-                        # Сохранить изменение qty
                         if cols[2].button("💾 Сохранить", key=f"save_{p['id']}_{idx}"):
                             cur_recipe[idx]["qtyPer"] = float(new_qty)
                             err = set_recipe(p["id"], cur_recipe)
                             if err: st.error(err)
                             else: st.success("Сохранено"); st.rerun()
-                        # Удалить строку
                         if cols[3].button("🗑 Удалить", key=f"del_{p['id']}_{idx}"):
                             new_list = [r for i, r in enumerate(cur_recipe) if i != idx]
                             err = set_recipe(p["id"], new_list)
@@ -451,7 +550,7 @@ with tab3:
 
                 st.markdown("---")
 
-                # Добавить новую строку в рецепт
+                # Добавить новую строку
                 st.markdown("**Добавить ингредиент:**")
                 ing_choices = sorted([(v["name"], k) for k, v in ing_map.items()], key=lambda x: x[0].lower())
                 name_to_id = {name: _id for name, _id in ing_choices}
@@ -461,7 +560,6 @@ with tab3:
                 add_qty = st.number_input(f"Количество ({default_unit})", min_value=0.0, step=1.0, key=f"add_qty_{p['id']}")
                 if st.button("➕ Добавить в рецепт", key=f"add_btn_{p['id']}"):
                     new_items = list(cur_recipe) if cur_recipe else []
-                    # если ингредиент уже есть — просто обновим qty
                     for item in new_items:
                         if item.get("ingredientId") == add_id:
                             item["qtyPer"] = float(add_qty)
@@ -472,14 +570,15 @@ with tab3:
                     if err: st.error(err)
                     else: st.success("Добавлено"); st.rerun()
 
-# --- Отчёты ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Отчёты
+# ──────────────────────────────────────────────────────────────────────────────
 with tab4:
     st.subheader("📊 Отчёты по продажам")
     today = datetime.now().date()
     col_from, col_to, col_btn = st.columns([3,3,2])
     d_from = col_from.date_input("С", value=today)
     d_to = col_to.date_input("По (включительно)", value=today)
-    # интерпретируем как [start, end+1)
     start_dt = datetime.combine(d_from, datetime.min.time()).astimezone()
     end_dt = datetime.combine(d_to, datetime.min.time()).astimezone() + timedelta(days=1)
 
@@ -489,14 +588,12 @@ with tab4:
             st.info("Продаж за период нет.")
         else:
             df_prod, df_ing = aggregate_sales(sales)
-
-            # подтянем имена продуктов/ингредиентов для красоты
             prods_map = {p["id"]: p["name"] for p in get_products()}
             ings_map = get_ingredients_map()
 
             if not df_prod.empty:
                 df_prod["product_name"] = df_prod["product_id"].map(lambda x: prods_map.get(x, x))
-                st.markdown("**Продажи по позициям**")
+                st.markdown('<div class="go-card"><b>Продажи по позициям</b></div>', unsafe_allow_html=True)
                 st.dataframe(df_prod[["product_name", "count"]].rename(columns={"product_name": "Позиция", "count": "Кол-во"}), hide_index=True, use_container_width=True)
                 st.download_button(
                     "Скачать CSV (позиции)",
@@ -508,7 +605,7 @@ with tab4:
             if not df_ing.empty:
                 df_ing["ingredient_name"] = df_ing["ingredient_id"].map(lambda x: ings_map.get(x, {}).get("name", x))
                 df_ing["unit"] = df_ing["ingredient_id"].map(lambda x: ings_map.get(x, {}).get("unit", ""))
-                st.markdown("**Суммарные списания ингредиентов**")
+                st.markdown('<div class="go-card"><b>Суммарные списания ингредиентов</b></div>', unsafe_allow_html=True)
                 st.dataframe(df_ing[["ingredient_name", "qty", "unit"]].rename(columns={"ingredient_name": "Ингредиент", "qty": "Кол-во"}), hide_index=True, use_container_width=True)
                 st.download_button(
                     "Скачать CSV (ингредиенты)",
@@ -516,3 +613,82 @@ with tab4:
                     file_name=f"ingredients_usage_{d_from}_{d_to}.csv",
                     mime="text/csv",
                 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Поставки (приход на склад + журнал)
+# ──────────────────────────────────────────────────────────────────────────────
+with tab5:
+    st.subheader("📦 Поставки (приход)")
+
+    ing_map = get_ingredients_map()
+    ing_choices = sorted([(v["name"], k) for k, v in ing_map.items()], key=lambda x: x[0].lower())
+    name_to_id = {name: _id for name, _id in ing_choices}
+
+    c1, c2, c3, c4 = st.columns([3,2,3,2])
+    sel_name = c1.selectbox("Ингредиент", [n for n, _ in ing_choices], key="dlv_sel")
+    sel_id = name_to_id.get(sel_name)
+    unit = ing_map.get(sel_id, {}).get("unit", "")
+    qty = c2.number_input(f"Количество ({unit})", min_value=0.0, step=10.0, key="dlv_qty")
+    supplier = c3.text_input("Поставщик / чек №", "")
+    note = c4.text_input("Комментарий", "")
+
+    col_ok, col_fast = st.columns([2,3])
+    if col_ok.button("✅ Принять поставку"):
+        if not sel_id or qty <= 0:
+            st.error("Выбери ингредиент и укажи количество > 0.")
+        else:
+            err = register_delivery(sel_id, float(qty), supplier, note)
+            if err: st.error(err)
+            else: st.success("Поставка записана, склад пополнен."); st.rerun()
+
+    # Быстрые кнопки (шаблоны)
+    with col_fast:
+        st.caption("Быстро:")
+        f1, f2, f3, f4 = st.columns(4)
+        if f1.button("+1000 g Зёрна"): register_delivery("beans", 1000, "—", "шаблон"); st.rerun()
+        if f2.button("+2000 g Зёрна"): register_delivery("beans", 2000, "—", "шаблон"); st.rerun()
+        if f3.button("+1000 ml Молоко"): register_delivery("milk", 1000, "—", "шаблон"); st.rerun()
+        if f4.button("+2000 ml Молоко"): register_delivery("milk", 2000, "—", "шаблон"); st.rerun()
+
+    st.markdown("---")
+    st.subheader("📒 Журнал поставок")
+    today = datetime.now().date()
+    col_from, col_to, col_btn = st.columns([3,3,2])
+    d_from = col_from.date_input("С", value=today - timedelta(days=7))
+    d_to = col_to.date_input("По (включительно)", value=today)
+    start_dt = datetime.combine(d_from, datetime.min.time()).astimezone()
+    end_dt = datetime.combine(d_to, datetime.min.time()).astimezone() + timedelta(days=1)
+
+    if col_btn.button("Показать"):
+        rows = get_deliveries_between(start_dt, end_dt)
+        if not rows:
+            st.info("За период поставок нет.")
+        else:
+            # Преобразуем для показа
+            show = []
+            for r in rows:
+                name = ing_map.get(r.get("ingredientId"), {}).get("name", r.get("ingredientId"))
+                unit = ing_map.get(r.get("ingredientId"), {}).get("unit", "")
+                qty = r.get("qty", 0)
+                supplier = r.get("supplier", "")
+                note = r.get("note", "")
+                ts = r.get("ts")
+                # ts может быть Timestamp — приведём к локальному времени
+                if hasattr(ts, "to_datetime"):
+                    ts = ts.to_datetime().astimezone()
+                show.append({
+                    "Дата/время": ts,
+                    "Ингредиент": name,
+                    "Кол-во": qty,
+                    "Ед.": unit,
+                    "Поставщик": supplier,
+                    "Комментарий": note,
+                })
+            df = pd.DataFrame(show).sort_values("Дата/время", ascending=False)
+            st.dataframe(df, hide_index=True, use_container_width=True)
+            st.download_button(
+                "Скачать CSV (поставки)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"deliveries_{d_from}_{d_to}.csv",
+                mime="text/csv",
+            )
