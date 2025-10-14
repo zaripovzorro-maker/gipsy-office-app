@@ -19,39 +19,78 @@ from google.cloud import firestore
 # Инициализация Firestore
 # =========================
 def init_firestore() -> firestore.Client:
-    """Создаёт Firestore client из st.secrets.
-    Поддерживает оба варианта: JSON-строка или TOML-таблица."""
-    # 1) PROJECT_ID
-    project_id = st.secrets.get("PROJECT_ID")
+    import json, os
+    from collections.abc import Mapping
+    import streamlit as st
+    from google.oauth2 import service_account
+    from google.cloud import firestore
+
+    project_id = (st.secrets.get("PROJECT_ID") or os.getenv("PROJECT_ID") or "").strip()
+    svc_raw = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
+
+    # Диагностика (без утечек содержимого)
+    st.sidebar.write("🔍 Secrets check")
+    st.sidebar.write(f"- PROJECT_ID present: {bool(project_id)}")
+    st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc_raw).__name__ if svc_raw is not None else 'None'}")
+
     if not project_id:
-        st.error("В Secrets нет PROJECT_ID.")
+        st.error("❌ В secrets нет PROJECT_ID.")
+        st.stop()
+    if svc_raw is None:
+        st.error("❌ В secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
-    # 2) FIREBASE_SERVICE_ACCOUNT: JSON-строка или таблица TOML
-    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
-    if not svc:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
-        st.stop()
-
-    if isinstance(svc, str):
+    # Приводим к dict
+    if isinstance(svc_raw, Mapping):
+        data = dict(svc_raw)
+    elif isinstance(svc_raw, str):
         try:
-            data = json.loads(svc)
-        except Exception:
-            st.error("FIREBASE_SERVICE_ACCOUNT: не удалось распарсить JSON-строку.")
+            data = json.loads(svc_raw)
+        except Exception as e:
+            st.error(f"❌ FIREBASE_SERVICE_ACCOUNT: невалидный JSON-строкой ({e}). "
+                     "Если используешь TOML-таблицу, не заключай её в кавычки.")
             st.stop()
-    elif isinstance(svc, dict):
-        data = dict(svc)
     else:
-        st.error("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
+        st.error("❌ FIREBASE_SERVICE_ACCOUNT должен быть таблицей TOML или JSON-строкой.")
         st.stop()
 
-    # 3) firebase_admin.initialize_app (один раз)
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(data)
-        firebase_admin.initialize_app(cred)
+    # Валидация ключевых полей
+    required_keys = ["type", "project_id", "private_key_id", "private_key", "client_email", "token_uri"]
+    missing = [k for k in required_keys if not data.get(k)]
+    if missing:
+        st.error(f"❌ В service account отсутствуют поля: {', '.join(missing)}. "
+                 "Скопируй JSON из Firebase консоли без изменений.")
+        st.stop()
 
-    return firestore.Client(project=project_id)
+    # Нормализация приватного ключа
+    pk = data.get("private_key", "")
+    # Если ключ пришёл с литералами \r\n или \\n — превращаем в реальные переводы строк
+    if "\\n" in pk and "\n" not in pk:
+        pk = pk.replace("\\r\\n", "\n").replace("\\n", "\n")
+    # Убираем возможные лишние пробелы по краям
+    pk = pk.strip()
+    data["private_key"] = pk
 
+    # Доп. диагностика по ключу (без вывода содержимого)
+    st.sidebar.write(f"- private_key length: {len(pk)}")
+    st.sidebar.write(f"- starts with BEGIN: {pk.startswith('-----BEGIN PRIVATE KEY-----')}")
+    st.sidebar.write(f"- contains newline: {('\\n' in pk) or (chr(10) in pk)}")
+
+    # Пробуем создать креды
+    try:
+        creds = service_account.Credentials.from_service_account_info(data)
+    except Exception as e:
+        st.error("❌ Не удалось обработать service account. Чаще всего это из-за поломанного private_key "
+                 "(попали лишние символы/кавычки). "
+                 "Ещё раз скопируй JSON из Firebase и вставь в Secrets ровно как есть "
+                 "(для JSON — одной строкой с \\n; для TOML — многострочно без \\n).")
+        st.stop()
+
+    try:
+        return firestore.Client(project=project_id, credentials=creds)
+    except Exception as e:
+        st.error(f"❌ Firestore client init failed: {e}")
+        st.stop()
 
 db: firestore.Client = init_firestore()
 
