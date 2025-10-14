@@ -1,55 +1,30 @@
-# streamlit_app.py
-# gipsy-office — учёт списаний (Streamlit + Firestore)
-
-from __future__ import annotations
-import json
-import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
-
-import pandas as pd
-import streamlit as st
-
+import json, streamlit as st
 import firebase_admin
-from firebase_admin import credentials
-from google.cloud import firestore
+from firebase_admin import credentials, firestore
 
-# =============  Firestore init  =============
-def init_firestore() -> firestore.Client:
-    """
-    Берём сервисный ключ из st.secrets:
-    - как TOML-таблица (мэп) FIREBASE_SERVICE_ACCOUNT
-    - или как JSON-строка FIREBASE_SERVICE_ACCOUNT
-    """
-    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
+def init_firestore():
+    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
     if not svc:
-        st.error(
-            "❌ В секрете не найден FIREBASE_SERVICE_ACCOUNT.\n"
-            "В Streamlit Cloud: ▶ Menu → Settings → Secrets → добавьте JSON ключ "
-            "или таблицу TOML для FIREBASE_SERVICE_ACCOUNT."
-        )
+        st.error("❌ В Secrets не найден FIREBASE_SERVICE_ACCOUNT. Открой ⋯ → Edit secrets и вставь ключ.")
         st.stop()
 
-    if isinstance(svc, str):
-        data = json.loads(svc)
-    elif isinstance(svc, dict):
-        data = dict(svc)
-        # многострочный приватный ключ может прийти без \n – нормализуем
-        if "private_key" in data and "\\n" in data["private_key"]:
-            data["private_key"] = data["private_key"].encode("utf-8").decode("unicode_escape")
+    # Преобразуем к dict
+    if isinstance(svc, dict):
+        data = svc
+    elif isinstance(svc, str):
+        try:
+            data = json.loads(svc)
+        except Exception as e:
+            st.error("❌ FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или TOML-таблицей.")
+            st.stop()
     else:
         st.error("❌ FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или TOML-таблицей.")
         st.stop()
 
-    try:
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(data)
-            firebase_admin.initialize_app(cred)
-        return firestore.Client(project=data.get("project_id"))
-    except Exception as e:
-        st.error(f"❌ Не удалось подключиться к Firestore: {e}")
-        st.stop()
-
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(data)
+        firebase_admin.initialize_app(cred, {"projectId": st.secrets.get("PROJECT_ID", data.get("project_id"))})
+    return firestore.client()
 
 db = init_firestore()
 
