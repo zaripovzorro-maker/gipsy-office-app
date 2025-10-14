@@ -1,456 +1,508 @@
-# streamlit_app.py
-# gipsy office — продажи с выбором объёма напитков и корзиной
-
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Any
 
 import streamlit as st
-
-# --- Firebase Admin / Firestore ---
+from google.cloud import firestore
 import firebase_admin
 from firebase_admin import credentials
-from google.cloud import firestore  # type: ignore
 
 
-# =========================
-# Firestore + Secrets init
-# =========================
+# ============== Firestore init (секреты) =================
 
-def _read_firebase_service_account() -> Dict:
+def _read_firebase_service_account() -> Dict[str, Any]:
     """
-    Берём сервисный ключ из st.secrets. Поддерживаем два варианта:
-
-    1) TOML-таблица:
-        [FIREBASE_SERVICE_ACCOUNT]
-        type = "service_account"
-        project_id = "gipsy-office"
-        ...
-
-    2) JSON-строка, целиком:
-        FIREBASE_SERVICE_ACCOUNT = "{\"type\":\"service_account\", ... \"private_key\":\"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n\"}"
-
-    Возвращаем питоновский dict, корректируя перевод строки в private_key.
+    Берём сервисный ключ из st.secrets.
+    Поддерживаются 2 формата:
+      1) TOML-таблица [FIREBASE_SERVICE_ACCOUNT] (ключи как поля)
+      2) JSON-строка FIREBASE_SERVICE_ACCOUNT (вся JSON строка целиком)
     """
     if "FIREBASE_SERVICE_ACCOUNT" not in st.secrets:
         raise RuntimeError("В Secrets отсутствует FIREBASE_SERVICE_ACCOUNT.")
 
     svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
 
-    if isinstance(svc, str):
-        # JSON-строка
-        data = json.loads(svc)
-    elif isinstance(svc, dict):
-        # TOML-таблица
+    # Вариант 1: таблица TOML -> dict
+    if isinstance(svc, dict):
         data = dict(svc)
+    # Вариант 2: JSON-строка
+    elif isinstance(svc, str):
+        try:
+            data = json.loads(svc)
+        except Exception:
+            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
     else:
         raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
 
-    # Нормализуем private_key: в JSON-строке внутри должны быть \n, в TOML — реальная новая строка.
-    pk = data.get("private_key", "")
-    # Если в ключе нет переноса строки, но есть секции BEGIN/END — добавим переводы
-    if "\\n" in pk and "-----BEGIN" in pk:
-        data["private_key"] = pk.replace("\\n", "\n")
-    elif "-----BEGIN" in pk and "\n" not in pk.strip():
-        # Редкий случай «одной строкой», стараемся починить
-        data["private_key"] = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n") \
-                                .replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
-
+    # небольшой хелпер-диагностика
+    pk: str = data.get("private_key", "")
+    if not (pk.startswith("-----BEGIN PRIVATE KEY-----") and "\\n" in pk):
+        raise RuntimeError(
+            "Не удалось обработать сервисный ключ. Чаще всего дело в формате private_key.\n"
+            "JSON-формат: ключ одной строкой, с символами \\n внутри.\n"
+            "TOML-формат: многострочно, без \\n внутри (как есть)."
+        )
     return data
 
 
+@st.cache_resource(show_spinner=False)
 def init_firestore() -> firestore.Client:
-    # PROJECT_ID (для клиента Firestore)
-    project_id = st.secrets.get("PROJECT_ID") or st.secrets.get("PROJECT") or st.secrets.get("project_id")
+    project_id = st.secrets.get("PROJECT_ID", "")
     if not project_id:
-        raise RuntimeError("В Secrets нет PROJECT_ID (или PROJECT / project_id).")
+        raise RuntimeError("В Secrets нет PROJECT_ID.")
 
     data = _read_firebase_service_account()
 
-    # Инициализируем firebase_admin один раз
+    # Инициализация firebase_admin ровно 1 раз
     if not firebase_admin._apps:
         cred = credentials.Certificate(data)
-        firebase_admin.initialize_app(cred)
-    # Клиент Firestore
+        firebase_admin.initialize_app(cred, {"projectId": project_id})
+
     return firestore.Client(project=project_id)
 
 
-# =========================
-# Модель корзины
-# =========================
+# ============== вспомогалки для UI & данных =================
 
-@dataclass
-class CartItem:
-    product_id: str
-    product_name: str
-    size_id: str
-    size_name: str
-    volume: Optional[float]
-    price: float
-    qty: int = 1
+def badge(text: str, color: str = "gray"):
+    st.markdown(
+        f"<span style='background:{color};color:white;padding:2px 8px;border-radius:8px;font-size:12px'>"
+        f"{text}</span>",
+        unsafe_allow_html=True,
+    )
 
 
-def cart_get() -> List[CartItem]:
+def ensure_state():
     if "cart" not in st.session_state:
-        st.session_state.cart = []
-    return st.session_state.cart
+        st.session_state.cart: List[Dict[str, Any]] = []
+    if "active_category" not in st.session_state:
+        st.session_state.active_category = None
+    if "active_product" not in st.session_state:
+        st.session_state.active_product = None
 
 
-def cart_add(item: CartItem) -> None:
-    cart = cart_get()
-    # Склеиваем одинаковые позиции (один и тот же продукт + размер)
-    for it in cart:
-        if it.product_id == item.product_id and it.size_id == item.size_id:
-            it.qty += item.qty
-            break
-    else:
-        cart.append(item)
+# --------- выборки из Firestore ---------
+
+def get_products(db: firestore.Client) -> List[Dict[str, Any]]:
+    docs = db.collection("products").stream()
+    res = []
+    for d in docs:
+        item = d.to_dict()
+        item["id"] = d.id
+        # ожидается структура:
+        # {
+        #   "category": "Кофе",
+        #   "name": "Капучино",
+        #   "sizes": [{"name":"S","label":"250 мл","price":150,"mult":1.0}, ...],
+        #   "recipe": {"beans": 16, "milk": 150}  # базовая доза
+        # }
+        res.append(item)
+    return res
 
 
-def cart_clear() -> None:
-    st.session_state.cart = []
+def get_ingredients(db: firestore.Client) -> List[Dict[str, Any]]:
+    docs = db.collection("ingredients").stream()
+    res = []
+    for d in docs:
+        item = d.to_dict()
+        item["id"] = d.id
+        # ожидается структура:
+        # { "name":"Зёрна", "unit":"g", "stock_quantity": 1200, "reorder_threshold": 200 }
+        res.append(item)
+    return res
 
 
-def cart_total() -> float:
-    return sum(i.price * i.qty for i in cart_get())
+# --------- продажи ---------
 
-
-# =========================
-# Firestore helpers
-# =========================
-
-def get_categories(db: firestore.Client) -> List[str]:
-    # Берём категории из активных продуктов
-    docs = db.collection("products").where("active", "==", True).stream()
-    cats = { (d.to_dict().get("category") or "Прочее") for d in docs }
-    return sorted(c for c in cats if c)
-
-
-def get_products_by_category(db: firestore.Client, category: str) -> List[Tuple[str, Dict]]:
-    # Возвращаем список (id, data)
-    q = db.collection("products").where("active", "==", True)
-    if category:
-        q = q.where("category", "==", category)
-    return [(d.id, d.to_dict()) for d in q.stream()]
-
-
-def get_sizes_for_product(db: firestore.Client, product_id: str) -> List[Tuple[str, Dict]]:
-    # Подколлекция sizes внутри products/{product_id}
-    coll = db.collection("products").document(product_id).collection("sizes")
-    sizes = [(d.id, d.to_dict()) for d in coll.stream()]
-    # Если размеров нет — вернём один «универсальный» размер из самого продукта (price / volume)
-    if not sizes:
-        prod = db.collection("products").document(product_id).get()
-        p = prod.to_dict() or {}
-        sizes = [(
-            "default",
-            {
-                "name": p.get("size_name") or "Стандарт",
-                "price": p.get("price", 0),
-                "volume": p.get("volume"),
-                # Можно положить сюда size.recipe, если нужно
-            },
-        )]
-    # Сортируем по price (если есть), иначе по имени
-    return sorted(sizes, key=lambda x: (x[1].get("price", 0), x[1].get("name", "")))
-
-
-def get_recipe_for_product_size(
-    db: firestore.Client, product_id: str, size_id: str, size_payload: Dict
-) -> Dict[str, float]:
-    """
-    Рецепт ищем так:
-    1) Если в документе размера есть ключ "recipe" (dict ingredient_id -> float), используем его.
-    2) Иначе берём базовый рецепт из коллекции recipes/{product_id}:
-       формат: {"items": [{"ingredient":"beans","amount":18,"unit":"g"}, ...]}
-    """
-    if "recipe" in size_payload and isinstance(size_payload["recipe"], dict):
-        # Прямой рецепт в размере
-        return {str(k): float(v) for k, v in size_payload["recipe"].items()}
-
-    rd = db.collection("recipes").document(product_id).get()
-    if not rd.exists:
-        return {}  # без рецепта просто ничего не спишем
-    data = rd.to_dict() or {}
-    items = data.get("items") or []
-    # items: [{ingredient, amount, unit}]
-    result: Dict[str, float] = {}
-    for it in items:
-        ing = it.get("ingredient")
-        amt = it.get("amount")
-        try:
-            if ing and amt is not None:
-                result[str(ing)] = float(amt)
-        except Exception:
-            pass
-    return result
-
-
-def adjust_stocks_transaction(
-    db: firestore.Client,
-    sale_items: List[CartItem],
-) -> None:
-    """
-    Пишем документ в sales и списываем ингредиенты в транзакции.
-    sale_items — окончательная корзина.
-    """
-    def _tx(transaction: firestore.Transaction):
-        # Суммируем по ингредиентам, что надо списать
-        to_decrease: Dict[str, float] = {}
-
-        for item in sale_items:
-            # Загружаем размер, чтобы достать его рецепт (или базовый)
-            size_doc = (
-                db.collection("products")
-                .document(item.product_id)
-                .collection("sizes")
-                .document(item.size_id)
-                .get(transaction=transaction)
-            )
-            size_payload = size_doc.to_dict() or {}
-            recipe = get_recipe_for_product_size(db, item.product_id, item.size_id, size_payload)
-
-            for ing_id, base_amt in recipe.items():
-                total_amt = base_amt * item.qty
-                to_decrease[ing_id] = to_decrease.get(ing_id, 0.0) + total_amt
-
-        # Пробуем списать
-        for ing_id, delta in to_decrease.items():
-            ref = db.collection("ingredients").document(ing_id)
-            snap = ref.get(transaction=transaction)
-            cur = (snap.to_dict() or {}).get("stock_quantity", 0.0)
-            new_val = float(cur) - float(delta)
-            if new_val < 0:
-                raise ValueError(f"Недостаточно '{ing_id}' на складе (есть {cur}, нужно {delta}).")
-            transaction.update(ref, {"stock_quantity": new_val})
-
-        # Запись продажи
-        db.collection("sales").document().set(
-            {
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "items": [
-                    {
-                        "product_id": it.product_id,
-                        "product_name": it.product_name,
-                        "size_id": it.size_id,
-                        "size_name": it.size_name,
-                        "volume": it.volume,
-                        "qty": it.qty,
-                        "price": it.price,
-                        "sum": it.price * it.qty,
-                    }
-                    for it in sale_items
-                ],
-                "total": sum(it.price * it.qty for it in sale_items),
-            },
-            merge=False,
-        )
-
-    db.transaction(_tx)  # type: ignore[attr-defined]
-
-
-# =========================
-# UI helpers / стили
-# =========================
-
-CSS = """
-<style>
-/* чуть симпатичных плиток */
-.gx-card {
-  border-radius: 14px;
-  border: 1px solid #e8e8ef;
-  padding: 12px 14px;
-  background: #fff;
-  transition: all .15s ease;
-  box-shadow: 0 2px 6px rgba(35,35,62,.05);
-}
-.gx-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(35,35,62,.08); }
-.gx-name { font-weight: 600; }
-.gx-sub { color:#6b7280; font-size: .85rem; }
-.gx-chip {
-  display:inline-block; padding:6px 10px; border-radius:10px; border:1px solid #e5e7eb;
-  margin-right:6px; margin-top:6px; cursor:pointer; background:#fafafa;
-}
-.gx-chip-active { background:#eaf3ff; border-color:#cfe6ff; }
-.gx-badge {
-  display:inline-flex; align-items:center; gap:6px; font-size:.9rem; color:#374151;
-}
-.gx-cart {
-  border-radius: 16px; border:1px solid #e5e7eb; background:#fcfcff; padding:16px;
-}
-.gx-total {
-  display:flex; justify-content:space-between; padding-top:10px; border-top:1px dashed #e5e7eb;
-  margin-top:8px; font-weight:700;
-}
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
-
-def chip(label: str, active: bool, key: str) -> bool:
-    """Возвращает True, если кликнули."""
-    cls = "gx-chip gx-chip-active" if active else "gx-chip"
-    return st.button(f"<span class='{cls}'>{label}</span>", key=key, help=label, type="secondary")
-
-
-# =========================
-# Основной UI
-# =========================
-
-def page_sales(db: firestore.Client):
+def ui_sales(db: firestore.Client):
+    ensure_state()
     st.title("gipsy office — продажи")
-
     st.info("Продажа проводится только при нажатии «Купить». До этого позиции лежат в корзине и остатки не меняются.")
 
-    cart_col, _ = st.columns([1, 0.15])
+    products = get_products(db)
+    if not products:
+        st.warning("В коллекции `products` пусто. Добавьте напитки (category, name, sizes[], recipe{}) в Firestore.")
+        return
 
-    with st.sidebar:
-        st.subheader("Навигация")
-        st.write("• Продажи\n• Склад\n• Рецепты\n• Поставки (см. верхние вкладки, если реализуете позже)")
+    # Корзина справа
+    cart_col = st.sidebar if st.session_state.get("cart_on_sidebar", False) else None
+    right = st.container()
+    left, right = st.columns([2, 1])
 
-    # Левая часть — категория → напитки
-    categories = get_categories(db)
-    st.subheader("Категории")
-    if "ui_category" not in st.session_state and categories:
-        st.session_state.ui_category = categories[0]
+    # Категории
+    categories = sorted({p.get("category", "Без категории") for p in products})
+    with left:
+        st.subheader("Категории")
+        cat_cols = st.columns(min(len(categories), 4) or 1)
+        for i, cat in enumerate(categories):
+            with cat_cols[i % len(cat_cols)]:
+                is_active = (st.session_state.active_category == cat)
+                btn = st.button(
+                    f"🍱 {cat}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                    key=f"cat_{cat}"
+                )
+                if btn:
+                    st.session_state.active_category = cat
+                    st.session_state.active_product = None
 
-    cat_cols = st.columns(min(4, max(1, len(categories))))
-    for i, cat in enumerate(categories):
-        active = st.session_state.ui_category == cat
-        if cat_cols[i % len(cat_cols)].button(
-            f"☕ {cat}", use_container_width=True, type=("primary" if active else "secondary")
-        ):
-            st.session_state.ui_category = cat
+        st.markdown("---")
 
-    st.write("---")
-    st.subheader(f"Напитки — {st.session_state.ui_category}")
+        if st.session_state.active_category:
+            st.subheader(f"Напитки — {st.session_state.active_category}")
+            prods = [p for p in products if p.get("category") == st.session_state.active_category]
+            if not prods:
+                st.write("В этой категории пока ничего нет.")
+            else:
+                grid = st.columns(3)
+                for i, p in enumerate(prods):
+                    with grid[i % 3]:
+                        is_selected = (st.session_state.active_product == p.get("id"))
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border:2px solid {'#3b82f6' if is_selected else '#e5e7eb'};
+                                border-radius:14px;padding:12px;margin-bottom:12px;">
+                                <div style="font-weight:600">{p.get('name','Без имени')}</div>
+                                <div style="font-size:12px;color:#6b7280">{p.get('category','')}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        if st.button("Выбрать", key=f"pick_{p['id']}", use_container_width=True):
+                            st.session_state.active_product = p["id"]
 
-    prods = get_products_by_category(db, st.session_state.ui_category)
-    grid_cols = st.columns(3)
+                # Объёмы/размеры
+                st.markdown("---")
+                if st.session_state.active_product:
+                    prod = next((x for x in products if x["id"] == st.session_state.active_product), None)
+                    if prod:
+                        st.subheader(f"{prod.get('name')}: объём/цена")
+                        sizes: List[Dict[str, Any]] = prod.get("sizes", [])
+                        scols = st.columns(min(len(sizes), 4) or 1)
+                        for i, s in enumerate(sizes):
+                            with scols[i % len(scols)]:
+                                label = s.get("label", s.get("name", ""))
+                                price = s.get("price", 0)
+                                pressed = st.button(f"{label}\n{price} ₽",
+                                                    key=f"size_{prod['id']}_{i}",
+                                                    use_container_width=True)
+                                if pressed:
+                                    st.session_state.cart.append({
+                                        "product_id": prod["id"],
+                                        "product_name": prod.get("name", ""),
+                                        "size_name": s.get("name", ""),
+                                        "size_label": label,
+                                        "price": price,
+                                        "mult": float(s.get("mult", 1.0)),
+                                    })
+                                    st.success(f"Добавлено в корзину: {prod.get('name')} ({label})")
 
-    for idx, (pid, pdata) in enumerate(prods):
-        col = grid_cols[idx % 3]
-        with col:
-            with st.container(border=True):
-                st.markdown(f"<div class='gx-card'>", unsafe_allow_html=True)
-                st.markdown(f"<div class='gx-name'>{pdata.get('name','Без названия')}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='gx-sub'>ID: {pid}</div>", unsafe_allow_html=True)
-
-                sizes = get_sizes_for_product(db, pid)
-                st.caption("Выберите объём / цену")
-
-                # локальное состояние выбранного размера для плитки
-                sel_key = f"sel_size_{pid}"
-                if sel_key not in st.session_state and sizes:
-                    st.session_state[sel_key] = sizes[0][0]
-
-                chip_row = st.container()
-                with chip_row:
-                    for sid, sdata in sizes:
-                        label = f"{sdata.get('name','Размер')} — {int(sdata.get('volume',0))} мл • {int(sdata.get('price',0))} ₽"
-                        if chip(label, st.session_state[sel_key] == sid, key=f"chip_{pid}_{sid}"):
-                            st.session_state[sel_key] = sid
-
-                st.write("")
-                qty = st.number_input("Кол-во", 1, 50, 1, key=f"qty_{pid}", label_visibility="collapsed")
-                add_ok = st.button("В корзину", use_container_width=True, key=f"add_{pid}", type="primary")
-
-                if add_ok:
-                    chosen_sid = st.session_state[sel_key]
-                    sdata = next((d for (sid, d) in sizes if sid == chosen_sid), None) or {}
-                    item = CartItem(
-                        product_id=pid,
-                        product_name=pdata.get("name", "Без названия"),
-                        size_id=chosen_sid,
-                        size_name=sdata.get("name", "Размер"),
-                        volume=sdata.get("volume"),
-                        price=float(sdata.get("price", 0)),
-                        qty=int(qty),
-                    )
-                    cart_add(item)
-                    st.success("Добавлено в корзину")
-
-                st.markdown("</div>", unsafe_allow_html=True)
-
-    # Правая колонка — корзина
-    with cart_col:
+    # Корзина справа
+    with right:
         st.subheader("🧺 Корзина")
-        cart = cart_get()
+        cart = st.session_state.cart
         if not cart:
             st.info("Корзина пуста. Добавьте напитки слева.")
         else:
-            with st.container(border=True):
-                for i, it in enumerate(cart):
-                    left, right = st.columns([0.7, 0.3])
-                    with left:
-                        st.markdown(
-                            f"**{it.product_name}** — {it.size_name}"
-                            + (f" ({int(it.volume)} мл)" if it.volume else "")
-                        )
-                        st.caption(f"{it.qty} × {int(it.price)} ₽")
-                    with right:
-                        # Изменение количества
-                        new_q = st.number_input(
-                            "qty", 1, 99, it.qty, key=f"q_cart_{i}", label_visibility="collapsed"
-                        )
-                        it.qty = int(new_q)
-                st.markdown(
-                    f"<div class='gx-total'><span>Итого:</span><span>{int(cart_total())} ₽</span></div>",
-                    unsafe_allow_html=True,
-                )
-            col_buy, col_clear = st.columns([0.6, 0.4])
-            if col_buy.button("Купить", type="primary", use_container_width=True):
+            total = 0
+            for idx, it in enumerate(cart):
+                c1, c2, c3 = st.columns([4, 2, 1])
+                with c1:
+                    st.write(f"**{it['product_name']}** — {it['size_label']}")
+                with c2:
+                    st.write(f"{it['price']} ₽")
+                with c3:
+                    if st.button("✖", key=f"rm_{idx}"):
+                        cart.pop(idx)
+                        st.experimental_rerun()
+                total += it["price"]
+
+            st.markdown("---")
+            st.write(f"**Итого:** {total} ₽")
+
+            if st.button("Купить", type="primary", use_container_width=True):
                 try:
-                    adjust_stocks_transaction(db, cart_get())
+                    _commit_sale(db, cart, products)
                 except Exception as e:
-                    st.error(f"Ошибка при списании: {e}")
+                    st.error(f"Не удалось провести продажу: {e}")
                 else:
-                    st.success("Продажа проведена ✅")
-                    cart_clear()
+                    st.success("Продажа проведена!")
+                    st.session_state.cart = []
                     st.experimental_rerun()
-            if col_clear.button("Очистить", use_container_width=True):
-                cart_clear()
-                st.experimental_rerun()
 
 
-def sidebar_secrets_check():
-    with st.sidebar:
-        st.markdown("### 🔍 Secrets check")
-        prj = bool(st.secrets.get("PROJECT_ID") or st.secrets.get("PROJECT") or st.secrets.get("project_id"))
-        st.write("• PROJECT_ID present:", "✅" if prj else "❌")
+# списание по рецептам
+def _commit_sale(db: firestore.Client, cart: List[Dict[str, Any]], products: List[Dict[str, Any]]):
+    if not cart:
+        return
+    # готовим агрегат списаний по ингредиентам
+    to_deduct: Dict[str, float] = {}
+    items = []
 
-        t = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
-        st.write("• FIREBASE_SERVICE_ACCOUNT type:", type(t).__name__)
-        if isinstance(t, dict):
-            pk = t.get("private_key", "")
-        elif isinstance(t, str):
-            try:
-                pk = json.loads(t).get("private_key", "")
-            except Exception:
-                pk = ""
+    for it in cart:
+        prod = next((p for p in products if p["id"] == it["product_id"]), None)
+        if not prod:
+            continue
+        mult = float(it.get("mult", 1.0))
+        recipe: Dict[str, float] = prod.get("recipe", {})
+        for ing_id, base_amount in recipe.items():
+            to_deduct[ing_id] = to_deduct.get(ing_id, 0.0) + float(base_amount) * mult
+
+        items.append({
+            "product_id": it["product_id"],
+            "name": it["product_name"],
+            "size": it["size_label"],
+            "price": it["price"],
+        })
+
+    # транзакция: списать и записать продажу
+    @firestore.transactional
+    def tx_op(tx: firestore.Transaction):
+        # списания
+        for ing_id, delta in to_deduct.items():
+            ref = db.collection("ingredients").document(ing_id)
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise RuntimeError(f"Ингредиент {ing_id} не найден.")
+            stock = float(snap.to_dict().get("stock_quantity", 0))
+            new_stock = stock - delta
+            if new_stock < -1e-6:
+                raise RuntimeError(f"Нельзя уйти в минус по {ing_id} (надо {delta}, остаток {stock}).")
+            tx.update(ref, {"stock_quantity": new_stock})
+
+        # запись продажи
+        sale_ref = db.collection("sales").document()
+        tx.set(sale_ref, {
+            "created_at": datetime.utcnow(),
+            "items": items,
+            "total": sum(i["price"] for i in items),
+        })
+
+    tx = db.transaction()
+    tx_op(tx)
+
+
+# --------- склад ---------
+
+def _status_color(pct: float) -> str:
+    if pct >= 0.75:
+        return "#10b981"  # green
+    if pct >= 0.5:
+        return "#60a5fa"  # blue
+    if pct >= 0.25:
+        return "#f59e0b"  # amber
+    return "#ef4444"      # red
+
+
+def ui_stock(db: firestore.Client):
+    st.title("Склад")
+    ing = get_ingredients(db)
+    if not ing:
+        st.info("Ингредиенты не найдены. Добавьте документы в коллекцию `ingredients`.")
+        return
+
+    DEFAULT_CAPACITY = {i["id"]: max(float(i.get("stock_quantity", 0)), float(i.get("reorder_threshold", 0)) * 4 or 1)
+                        for i in ing}
+
+    for item in ing:
+        cap = DEFAULT_CAPACITY.get(item["id"], 1.0)
+        stock = float(item.get("stock_quantity", 0))
+        pct = stock / cap if cap > 0 else 0
+        color = _status_color(pct)
+
+        with st.container():
+            st.markdown(
+                f"<div style='border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin-bottom:10px'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                f"<div><b>{item.get('name','')}</b> "
+                f"<span style='color:#6b7280'>(норма {int(cap)} {item.get('unit','')})</span></div>"
+                f"<div style='color:{color}'><b>{int(pct*100)}%</b></div>"
+                f"</div></div>", unsafe_allow_html=True
+            )
+
+            c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 2, 2])
+            if c1.button("+", key=f"plus_{item['id']}"):
+                _adj_stock(db, item["id"], +50)
+            if c2.button("-", key=f"minus_{item['id']}"):
+                _adj_stock(db, item["id"], -50)
+            delta = c3.number_input("±", key=f"delta_{item['id']}", step=10, value=0)
+            if c4.button("Применить", key=f"apply_{item['id']}"):
+                _adj_stock(db, item["id"], float(delta))
+            c5.write(f"Остаток: **{int(stock)} {item.get('unit','')}**")
+
+
+def _adj_stock(db: firestore.Client, ing_id: str, delta: float):
+    @firestore.transactional
+    def tx_op(tx: firestore.Transaction):
+        ref = db.collection("ingredients").document(ing_id)
+        snap = ref.get(transaction=tx)
+        if not snap.exists:
+            raise RuntimeError("Ингредиент не найден.")
+        stock = float(snap.to_dict().get("stock_quantity", 0))
+        new_stock = stock + delta
+        if new_stock < -1e-6:
+            raise RuntimeError("Нельзя уйти в минус.")
+        tx.update(ref, {"stock_quantity": new_stock})
+
+    tx = db.transaction()
+    tx_op(tx)
+
+
+# --------- рецепты ---------
+
+def ui_recipes(db: firestore.Client):
+    st.title("Рецепты")
+    prods = get_products(db)
+    ing = get_ingredients(db)
+    ing_map = {i["id"]: i for i in ing}
+
+    if not prods:
+        st.info("Пусто в `products`.")
+        return
+
+    for p in prods:
+        with st.expander(f"{p.get('category','?')} • {p.get('name','?')}", expanded=False):
+            recipe: Dict[str, float] = dict(p.get("recipe", {}))
+            st.write("**Базовая доза (для размера с mult=1.0):**")
+            # показ рецепта
+            for ing_id, amount in recipe.items():
+                row = st.columns([3, 2, 1])
+                with row[0]:
+                    st.write(ing_map.get(ing_id, {}).get("name", ing_id))
+                with row[1]:
+                    new_amount = st.number_input("г/мл", value=float(amount), key=f"rcp_{p['id']}_{ing_id}")
+                    recipe[ing_id] = new_amount
+                with row[2]:
+                    if st.button("Удалить", key=f"rcp_del_{p['id']}_{ing_id}"):
+                        recipe.pop(ing_id, None)
+                        _save_product_recipe(db, p["id"], recipe)
+                        st.experimental_rerun()
+
+            # добавление строки
+            st.markdown("---")
+            c1, c2, c3 = st.columns([3, 2, 1])
+            with c1:
+                add_ing = st.selectbox("Ингредиент", options=["—"] + [i["id"] for i in ing],
+                                       format_func=lambda x: "—" if x == "—" else ing_map[x]["name"],
+                                       key=f"add_ing_{p['id']}")
+            with c2:
+                add_amt = st.number_input("Доза", min_value=0.0, value=0.0, step=1.0, key=f"add_amt_{p['id']}")
+            with c3:
+                if st.button("Добавить", key=f"add_btn_{p['id']}") and add_ing != "—" and add_amt > 0:
+                    recipe[add_ing] = add_amt
+                    _save_product_recipe(db, p["id"], recipe)
+                    st.success("Сохранено.")
+                    st.experimental_rerun()
+
+            if st.button("💾 Сохранить все изменения", key=f"save_{p['id']}"):
+                _save_product_recipe(db, p["id"], recipe)
+                st.success("Сохранено.")
+
+
+def _save_product_recipe(db: firestore.Client, prod_id: str, recipe: Dict[str, float]):
+    db.collection("products").document(prod_id).update({"recipe": recipe})
+
+
+# --------- поставки ---------
+
+def ui_deliveries(db: firestore.Client):
+    st.title("Поставки (приход на склад)")
+    ing = get_ingredients(db)
+    if not ing:
+        st.info("Нет ингредиентов.")
+        return
+    ing_map = {i["name"]: i for i in ing}
+    names = sorted(ing_map.keys())
+
+    with st.form("delivery_form", clear_on_submit=True):
+        name = st.selectbox("Ингредиент", names)
+        qty = st.number_input("Количество (в единицах ингредиента)", min_value=0.0, step=10.0)
+        dt = st.date_input("Дата поставки", value=datetime.utcnow().date())
+        submitted = st.form_submit_button("Добавить приход")
+        if submitted and qty > 0:
+            item = ing_map[name]
+            _adj_stock(db, item["id"], float(qty))
+            db.collection("deliveries").add({
+                "ingredient_id": item["id"],
+                "name": item["name"],
+                "qty": float(qty),
+                "at": datetime(dt.year, dt.month, dt.day),
+            })
+            st.success("Поставка зафиксирована.")
+
+    # последние поставки
+    st.markdown("---")
+    st.subheader("Последние поставки")
+    docs = db.collection("deliveries").order_by("at", direction=firestore.Query.DESCENDING).limit(20).stream()
+    rows = []
+    for d in docs:
+        r = d.to_dict()
+        rows.append([r.get("name"), r.get("qty"), r.get("at")])
+    if rows:
+        st.table(rows)
+    else:
+        st.write("Пока пусто.")
+
+
+# ===================== main =====================
+
+def secrets_check():
+    st.sidebar.markdown("### ✅ Secrets check")
+    ok = True
+    def row(label, cond):
+        nonlocal ok
+        ok = ok and cond
+        st.sidebar.write(f"• {label}: {'🟩 True' if cond else '🟥 False'}")
+
+    row("PROJECT_ID present", "PROJECT_ID" in st.secrets)
+    has = "FIREBASE_SERVICE_ACCOUNT" in st.secrets
+    row("FIREBASE_SERVICE_ACCOUNT type: str", has and isinstance(st.secrets["FIREBASE_SERVICE_ACCOUNT"], str))
+    # если таблица — тоже ок
+    if has and isinstance(st.secrets["FIREBASE_SERVICE_ACCOUNT"], dict):
+        st.sidebar.write("• FIREBASE_SERVICE_ACCOUNT type: dict (ok)")
+    # лёгкая диагностика приватного ключа
+    try:
+        svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
+        if isinstance(svc, str):
+            data = json.loads(svc)
         else:
-            pk = ""
-        st.write("• private_key length:", len(pk))
-        st.write("• starts with BEGIN:", "✅" if "BEGIN PRIVATE KEY" in pk else "❌")
-        st.write("• contains \\n literal:", "✅" if "\\n" in (t if isinstance(t, str) else str(pk)) else "❌")
+            data = dict(svc)
+        pk = data.get("private_key", "")
+        st.sidebar.write(f"• private_key length:  {len(pk)}")
+        st.sidebar.write(f"• starts with BEGIN:   {pk.startswith('-----BEGIN PRIVATE KEY-----')}")
+        st.sidebar.write(f"• contains \\n literal: {'\\n' in pk}")
+    except Exception:
+        st.sidebar.write("• private_key: (не разобран)")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Навигация")
+    st.sidebar.write("• Продажи • Склад • Рецепты • Поставки (см. верхние вкладки, если реализуете позже)")
 
 
 def main():
     st.set_page_config(page_title="gipsy office — учёт", page_icon="☕", layout="wide")
-    sidebar_secrets_check()
+    secrets_check()
 
-    # Подключаемся к БД
+    # Firestore
     try:
         db = init_firestore()
     except Exception as e:
-        st.error(f"❌ Не удалось инициализировать Firestore: {e}")
-        st.stop()
+        st.error(f"Не удалось инициализировать Firestore: {e}")
+        return
 
-    # Главная страница — продажи
-    page_sales(db)
+    tabs = st.tabs(["Продажи", "Склад", "Рецепты", "Поставки"])
+
+    with tabs[0]:
+        ui_sales(db)
+    with tabs[1]:
+        ui_stock(db)
+    with tabs[2]:
+        ui_recipes(db)
+    with tabs[3]:
+        ui_deliveries(db)
 
 
 if __name__ == "__main__":
