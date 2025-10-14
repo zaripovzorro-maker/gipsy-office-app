@@ -2,5 +2,5 @@ streamlit
 firebase-admin
 google-cloud-firestore
 pandas
-qrcode
-pillow
+rcode[pil]==7.4.2
+pillow>=10.0.0
