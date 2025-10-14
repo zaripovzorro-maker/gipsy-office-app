@@ -1,302 +1,412 @@
-# streamlit_app.py
-# gipsy-office — учёт списаний / склад / рецепты (Streamlit + Firestore)
-
-from __future__ import annotations
+# -*- coding: utf-8 -*-
+# gipsy-office — учёт товаров (Streamlit + Firestore + QR-пополнения)
+import os
 import json
+import io
 import time
-from typing import Dict, List, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Mapping
 
-import pandas as pd
 import streamlit as st
-
-import firebase_admin
-from firebase_admin import credentials
+import pandas as pd
 from google.cloud import firestore
+from google.oauth2 import service_account
 
-# ==============================
-# Firestore init из st.secrets
-# ==============================
+# QR
+import qrcode
+from PIL import Image
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Визуальные настройки (светлая тема + кастомные карточки/полосы)
+# ──────────────────────────────────────────────────────────────────────────────
+LIGHT_CSS = """
+<style>
+/* общие отступы и фон карточек */
+.gy-card {
+  border: 1px solid rgba(0,0,0,0.08);
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+
+/* подсветка последней нажатой позиции */
+.gy-card.last {
+  border: 2px solid #22c55e;
+  background: #f0fff4;
+}
+
+/* цветная полоска прогресса */
+.gy-bar {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: #f0f2f6;
+  overflow: hidden;
+  border: 1px solid rgba(0,0,0,0.06);
+}
+.gy-bar > div {
+  height: 100%;
+  transition: width .3s ease;
+}
+
+/* зел/желт/оранж/крас для процентов */
+.gy-pct-green { background: linear-gradient(90deg, #86efac, #22c55e); }
+.gy-pct-yellow { background: linear-gradient(90deg, #fde68a, #f59e0b); }
+.gy-pct-orange { background: linear-gradient(90deg, #fdba74, #f97316); }
+.gy-pct-red { background: linear-gradient(90deg, #fca5a5, #ef4444); }
+
+/* большие удобные кнопки */
+button[kind="secondary"] { padding: 10px 12px; }
+div.stButton > button {
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-weight: 600;
+}
+</style>
+"""
+st.markdown(LIGHT_CSS, unsafe_allow_html=True)
+
+# Нормы склада (для процентов, по умолчанию)
+DEFAULT_CAPACITY: Dict[str, float] = {
+    "beans": 2000.0,   # грамм
+    "milk": 5000.0,    # мл
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Firestore init — читаем secrets и создаём google-auth креды
+# ──────────────────────────────────────────────────────────────────────────────
 def init_firestore() -> firestore.Client:
-    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
-    if not svc:
-        st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT. Открой Manage app → Edit secrets и вставь ключ.")
+    project_id = (st.secrets.get("PROJECT_ID") or os.getenv("PROJECT_ID") or "").strip()
+    svc_raw: Any = st.secrets.get("FIREBASE_SERVICE_ACCOUNT", None)
+
+    # Диагностика (без утечек)
+    st.sidebar.write("🔍 Secrets:")
+    st.sidebar.write(f"- PROJECT_ID: {project_id or '❌ нет'}")
+    st.sidebar.write(f"- FIREBASE_SERVICE_ACCOUNT type: {type(svc_raw).__name__}")
+
+    if not project_id:
+        st.error('❌ В secrets нет PROJECT_ID. Добавь строку: PROJECT_ID = "gipsy-office"')
+        st.stop()
+    if svc_raw is None:
+        st.error("❌ В secrets нет FIREBASE_SERVICE_ACCOUNT (таблица TOML или JSON-строка).")
         st.stop()
 
-    # допускаем JSON-строку или TOML-таблицу
-    if isinstance(svc, str):
+    # Превращаем в dict (поддерживаем AttrDict, dict, str(JSON))
+    if isinstance(svc_raw, Mapping):
+        svc = dict(svc_raw)
+    elif isinstance(svc_raw, str):
         try:
-            data = json.loads(svc)
-        except Exception as e:
-            st.error(f"FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой. Ошибка: {e}")
+            svc = json.loads(svc_raw.strip())
+        except Exception:
+            st.error("❌ FIREBASE_SERVICE_ACCOUNT задан строкой, но это невалидный JSON.")
             st.stop()
     else:
-        # toml-таблица → dict
-        data = dict(svc)
-
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(data)
-        firebase_admin.initialize_app(cred)
-
-    project_id = st.secrets.get("PROJECT_ID")
-    if not project_id:
-        st.error("В Secrets нет PROJECT_ID.")
+        st.error(f"❌ FIREBASE_SERVICE_ACCOUNT должен быть mapping или JSON-строкой, получено: {type(svc_raw).__name__}")
         st.stop()
 
-    return firestore.Client(project=project_id)
+    # Быстрые флаги
+    st.sidebar.write(f"- has private_key: {bool(svc.get('private_key'))}")
+    st.sidebar.write(f"- sa project_id: {svc.get('project_id', '—')}")
 
+    # Создаём google-auth креды из service account info
+    try:
+        creds = service_account.Credentials.from_service_account_info(svc)
+        db = firestore.Client(project=project_id, credentials=creds)
+        return db
+    except Exception as e:
+        st.error(f"❌ Не удалось создать Firestore client: {e}")
+        st.info("Проверь формат секрета: [FIREBASE_SERVICE_ACCOUNT] с многострочным private_key и PROJECT_ID снаружи.")
+        st.stop()
+
+# Глобальный клиент БД
 db = init_firestore()
 
-# =======================================
-# Коллекции и базовые функции Firestore
-# =======================================
-COL_PRODUCTS   = "products"
-COL_ING        = "ingredients"
-COL_RECIPES    = "recipes"
-COL_SALES      = "sales"
-DOC_META_LAST  = "meta/last_sale"  # для Undo
+# ──────────────────────────────────────────────────────────────────────────────
+# Коллекции
+# ──────────────────────────────────────────────────────────────────────────────
+def _ingredients_ref():
+    return db.collection("ingredients")
+def _products_ref():
+    return db.collection("products")
+def _recipes_ref():
+    return db.collection("recipes")
+def _sales_ref():
+    return db.collection("sales")
+def _supplies_ref():
+    return db.collection("supplies")   # история поставок
 
-def doc_to_dict(doc) -> Dict[str, Any]:
-    d = doc.to_dict() or {}
-    d["id"] = doc.id
-    return d
+# ──────────────────────────────────────────────────────────────────────────────
+# Утилиты
+# ──────────────────────────────────────────────────────────────────────────────
+def status_label(percent: float) -> str:
+    if percent >= 75: return "🟢 Супер"
+    if percent >= 50: return "🟡 Норм"
+    if percent >= 25: return "🟠 Готовиться"
+    return "🔴 Срочно"
 
-def get_products() -> List[Dict[str, Any]]:
-    return [doc_to_dict(d) for d in db.collection(COL_PRODUCTS).stream()]
+def pct_class(p: float) -> str:
+    if p >= 75: return "gy-pct-green"
+    if p >= 50: return "gy-pct-yellow"
+    if p >= 25: return "gy-pct-orange"
+    return "gy-pct-red"
 
 def get_ingredients_map() -> Dict[str, Dict[str, Any]]:
-    m = {}
-    for d in db.collection(COL_ING).stream():
-        m[d.id] = doc_to_dict(d)
+    docs = _ingredients_ref().stream()
+    m: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        data = d.to_dict() or {}
+        m[d.id] = {
+            "name": data.get("name", d.id),
+            "unit": data.get("unit", "g" if d.id == "beans" else "ml"),
+            "capacity": float(data.get("capacity", DEFAULT_CAPACITY.get(d.id, 0))),
+            "stock_quantity": float(data.get("stock_quantity", 0)),
+        }
     return m
 
+def format_recipe_line(recipe_item: Dict[str, Any], ing_map: Dict[str, Dict[str, Any]]) -> str:
+    ing_id = recipe_item.get("ingredientId")
+    qty = float(recipe_item.get("qtyPer", 0))
+    meta = ing_map.get(ing_id, {"name": ing_id, "unit": ""})
+    unit = meta.get("unit", "")
+    name = meta.get("name", ing_id)
+    amount = int(qty) if qty.is_integer() else qty
+    return f"- {name}: {amount} {unit}".strip()
+
+def percent(cur: float, cap: float) -> int:
+    cap = cap or 1
+    return int(round(100 * cur / cap))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CRUD
+# ──────────────────────────────────────────────────────────────────────────────
+def get_ingredients() -> List[Dict[str, Any]]:
+    docs = _ingredients_ref().stream()
+    items: List[Dict[str, Any]] = []
+    for d in docs:
+        data = d.to_dict() or {}
+        items.append({
+            "id": d.id,
+            "name": data.get("name", d.id),
+            "stock_quantity": float(data.get("stock_quantity", 0)),
+            "unit": data.get("unit", "g" if d.id == "beans" else "ml"),
+            "capacity": float(data.get("capacity", DEFAULT_CAPACITY.get(d.id, 0))),
+        })
+    return sorted(items, key=lambda x: x["id"])
+
+def get_products() -> List[Dict[str, Any]]:
+    docs = _products_ref().stream()
+    items: List[Dict[str, Any]] = []
+    for d in docs:
+        if d.id.lower() in {"capacity", "_meta", "_settings"}:
+            continue
+        data = d.to_dict() or {}
+        items.append({
+            "id": d.id,
+            "name": data.get("name", d.id),
+            "price": float(data.get("price", 0)),
+        })
+    return sorted(items, key=lambda x: x["name"].lower())
+
 def get_recipe(product_id: str) -> List[Dict[str, Any]]:
-    doc = db.collection(COL_RECIPES).document(product_id).get()
+    doc = _recipes_ref().document(product_id).get()
+    if not doc.exists:
+        return []
     data = doc.to_dict() or {}
-    return data.get("items", [])
+    return list(data.get("items", []))
 
-# транзакция списания с записью операций — пригодится для Undo
-def _sell_tx(transaction, product_id: str) -> str | None:
-    recipe = get_recipe(product_id)
-    if not recipe:
-        return "У продукта нет рецепта."
-
-    ing_refs = []
-    ops = []  # для Undo
-    # проверка остатков и сбор обновлений
-    for item in recipe:
-        ing_id = item["ingredientId"]
-        qty    = float(item.get("qtyPer", 0))
-        if qty <= 0:
-            return f"В рецепте {product_id} неверная дозировка {qty} у {ing_id}."
-
-        ref = db.collection(COL_ING).document(ing_id)
-        snap = ref.get(transaction=transaction)
-        if not snap.exists:
-            return f"Ингредиент {ing_id} не найден."
-        data = snap.to_dict() or {}
-        stock = float(data.get("stock_quantity", 0.0))
-        next_val = stock - qty
-        if next_val < 0:
-            return f"Недостаточно на складе: {data.get('name', ing_id)}. Остаток {stock}, нужно {qty}."
-
-        ing_refs.append((ref, next_val))
-        ops.append({"ingredientId": ing_id, "delta": -qty})
-
-    # применяем обновления
-    for ref, next_val in ing_refs:
-        transaction.update(ref, {"stock_quantity": next_val})
-
-    # сохраняем «последнюю продажу» для Undo в одном документе
-    transaction.set(db.document(DOC_META_LAST), {"productId": product_id, "ops": ops, "ts": firestore.SERVER_TIMESTAMP})
-    # и лог продаж
-    transaction.set(db.collection(COL_SALES).document(), {"productId": product_id, "ops": ops, "ts": firestore.SERVER_TIMESTAMP})
-    return None
-
-def sell_product(product_id: str) -> str | None:
+def set_recipe(product_id: str, items: List[Dict[str, Any]]) -> Optional[str]:
     try:
-        return db.transaction()( _sell_tx )(product_id)
+        _recipes_ref().document(product_id).set({"items": items})
+        return None
     except Exception as e:
-        return f"Ошибка списания: {e}"
+        return str(e)
 
-def _undo_tx(transaction) -> str | None:
-    snap = db.document(DOC_META_LAST).get(transaction=transaction)
-    if not snap.exists:
-        return "Нет операции для отката."
-
-    meta = snap.to_dict() or {}
-    ops: List[Dict[str, Any]] = meta.get("ops", [])
-    if not ops:
-        return "Пустая операция."
-
-    # откатываем: просто меняем знак и плюсуем
-    for op in ops:
-        ing_id = op["ingredientId"]
-        delta  = float(op.get("delta", 0))  # в last было отрицательное
-        ref = db.collection(COL_ING).document(ing_id)
-        s = ref.get(transaction=transaction).to_dict() or {}
-        stock = float(s.get("stock_quantity", 0.0))
-        transaction.update(ref, {"stock_quantity": stock - delta})  # минус минус = плюс
-
-    transaction.delete(db.document(DOC_META_LAST))
-    return None
-
-def undo_last_sale() -> str | None:
+def set_product_price(product_id: str, new_price: float) -> Optional[str]:
     try:
-        return db.transaction()(_undo_tx)()
+        _products_ref().document(product_id).set({"price": float(new_price)}, merge=True)
+        return None
     except Exception as e:
-        return f"Ошибка Undo: {e}"
+        return str(e)
 
-# ================================
-# Стили (карточки / плитки / UI)
-# ================================
-st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
-
-st.markdown("""
-<style>
-:root{
-  --card-bg:#ffffff; --card-border:#e5e7eb;
-}
-[data-testid="stAppViewContainer"] { background:#fafafa; }
-
-/* заголовок компактнее */
-h1 { margin-bottom:.25rem }
-
-/* карточки одной высоты + кнопка внизу */
-.card {
-  background:var(--card-bg); border:1px solid var(--card-border);
-  border-radius:14px; padding:14px; margin-bottom:12px;
-  display:flex; flex-direction:column; min-height:220px;
-}
-.card .price{ font-weight:700; opacity:.85; margin:.25rem 0 .5rem }
-.card .caption{ color:#6b7280; font-size:0.9rem; line-height:1.35rem }
-.card .grow{ flex:1 }
-.big-btn button{ width:100%; padding:14px 16px; font-size:18px; border-radius:12px; }
-
-/* бейдж «только что» */
-.badge{
-  display:inline-block; margin-left:.5rem;
-  background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0;
-  padding:.15rem .45rem; font-size:.78rem; border-radius:999px;
-}
-
-/* плитки — большие кнопки */
-.tile{ margin-bottom:12px; }
-.tile .stButton>button {
-  width:100%; height:88px; font-size:20px; font-weight:700;
-  border-radius:14px; border:1px solid var(--card-border);
-  background:#ffffff;
-}
-.tile .stButton>button:hover { background:#f3f4f6; }
-.tile .price { font-weight:600; opacity:.85; margin-left:8px }
-
-/* лёгкий «хайлайт» последней продажи */
-.highlight{ box-shadow:0 0 0 2px #86efac inset; }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("gipsy-office — учёт списаний")
-
-# Панель «первая настройка»
-with st.expander("⚙️ Первая настройка / создать тестовые данные"):
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("Создать пример данных"):
-            # ингредиенты
-            db.collection(COL_ING).document("beans").set({
-                "name":"Зёрна", "unit":"g", "capacity":2000, "stock_quantity":1964, "reorder_threshold":200
-            })
-            db.collection(COL_ING).document("milk").set({
-                "name":"Молоко", "unit":"ml", "capacity":5000, "stock_quantity":1650, "reorder_threshold":1000
-            })
-            # продукты
-            db.collection(COL_PRODUCTS).document("cappuccino").set({"name":"Капучино", "price":250})
-            db.collection(COL_PRODUCTS).document("espresso").set({"name":"Эспрессо", "price":150})
-            # рецепты
-            db.collection(COL_RECIPES).document("espresso").set({"items":[{"ingredientId":"beans","qtyPer":18}]})
-            db.collection(COL_RECIPES).document("cappuccino").set({"items":[
-                {"ingredientId":"beans","qtyPer":18},{"ingredientId":"milk","qtyPer":150}
-            ]})
-            st.success("Готово.")
-
-# =================
-# ВКЛАДКИ
-# =================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Позиции","Склад","Рецепты","Отчёты","QR-коды"])
-
-# -----------------
-# Позиции (продажи)
-# -----------------
-with tab1:
+def adjust_stock(ingredient_id: str, delta: float) -> Optional[str]:
     try:
-        view_mode = st.segmented_control("Вид", options=["Карточки","Плитки"], default="Карточки")
+        ref = _ingredients_ref().document(ingredient_id)
+        snap = ref.get()
+        cur = float((snap.to_dict() or {}).get("stock_quantity", 0))
+        new_val = cur + delta
+        if new_val < 0:
+            return "❌ Нельзя увести остаток в минус."
+        ref.update({"stock_quantity": new_val})
+        return None
+    except Exception as e:
+        return str(e)
+
+def record_supply(ingredient_id: str, quantity: float) -> Optional[str]:
+    """Пополнение склада: +quantity к ингредиенту и запись в коллекцию supplies"""
+    try:
+        err = adjust_stock(ingredient_id, float(quantity))
+        if err:
+            return err
+        _supplies_ref().document().set({
+            "ingredient_id": ingredient_id,
+            "quantity": float(quantity),
+            "ts": firestore.SERVER_TIMESTAMP,
+        })
+        return None
+    except Exception as e:
+        return str(e)
+
+def sell_product(product_id: str) -> Optional[str]:
+    try:
+        recipe = get_recipe(product_id)
+        if not recipe:
+            return "Нет рецепта для этой позиции."
+        for it in recipe:
+            err = adjust_stock(it["ingredientId"], -float(it["qtyPer"]))
+            if err:
+                return err
+        _sales_ref().document().set({
+            "product_id": product_id,
+            "ts": firestore.SERVER_TIMESTAMP,
+            "items": recipe,
+        })
+        return None
+    except Exception as e:
+        return str(e)
+
+def undo_last_sale() -> Optional[str]:
+    try:
+        q = _sales_ref().order_by("ts", direction=firestore.Query.DESCENDING).limit(1).stream()
+        last = next(q, None)
+        if not last:
+            return "Нет продаж для отмены."
+        sale = last.to_dict() or {}
+        for it in sale.get("items", []):
+            adjust_stock(it["ingredientId"], float(it["qtyPer"]))
+        last.reference.delete()
+        return None
+    except Exception as e:
+        return str(e)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Отчёты
+# ──────────────────────────────────────────────────────────────────────────────
+def get_sales_between(dt_from: datetime, dt_to: datetime) -> List[Dict[str, Any]]:
+    dt_from_utc = dt_from.astimezone(timezone.utc)
+    dt_to_utc = dt_to.astimezone(timezone.utc)
+    q = (_sales_ref()
+         .where("ts", ">=", dt_from_utc)
+         .where("ts", "<", dt_to_utc)
+         .order_by("ts"))
+    return [dict(d.to_dict() or {}, id=d.id) for d in q.stream()]
+
+def aggregate_sales(sales: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    by_product: Dict[str, int] = {}
+    by_ingredient: Dict[str, float] = {}
+    for s in sales:
+        pid = s.get("product_id", "unknown")
+        by_product[pid] = by_product.get(pid, 0) + 1
+        for it in s.get("items", []):
+            ing = it.get("ingredientId")
+            qty = float(it.get("qtyPer", 0))
+            by_ingredient[ing] = by_ingredient.get(ing, 0.0) + qty
+    df_prod = pd.DataFrame([{"product_id": k, "count": v} for k, v in by_product.items()]).sort_values("count", ascending=False) if by_product else pd.DataFrame(columns=["product_id", "count"])
+    df_ing = pd.DataFrame([{"ingredient_id": k, "qty": v} for k, v in by_ingredient.items()]).sort_values("qty", ascending=False) if by_ingredient else pd.DataFrame(columns=["ingredient_id", "qty"])
+    return df_prod, df_ing
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Query params (быстрые пополнения по QR)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_query_params() -> Dict[str, List[str]]:
+    # Streamlit >=1.30: st.query_params, fallback на experimental
+    try:
+        return dict(st.query_params)  # type: ignore[attr-defined]
     except Exception:
-        view_mode = st.radio("Вид", ["Карточки","Плитки"], horizontal=True, index=0)
+        return st.experimental_get_query_params()
 
+def base_app_url_input() -> str:
+    """URL приложения для QR (можно сохранить в secrets как BASE_URL)."""
+    default = st.secrets.get("BASE_URL", "")
+    return st.text_input("Базовый URL приложения (для QR)", value=default, placeholder="https://your-app.streamlit.app")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="gipsy-office — учёт", page_icon="☕", layout="wide")
+st.title("☕ gipsy-office — учёт списаний")
+
+# Быстрое пополнение, если пришли из QR: ?restock=milk&qty=500
+qp = get_query_params()
+if "restock" in qp and "qty" in qp:
+    ing_id = qp["restock"][0]
+    try:
+        qty = float(qp["qty"][0])
+    except Exception:
+        qty = 0.0
+    if qty > 0:
+        st.info(f"QR-пополнение: {ing_id} +{qty}")
+        if st.button("Подтвердить пополнение"):
+            err = record_supply(ing_id, qty)
+            if err: st.error(err)
+            else: st.success("Пополнено ✅"); st.rerun()
+
+# Первая настройка
+with st.expander("⚙️ Первая настройка / создать тестовые данные"):
+    if st.button("Создать тестовые данные"):
+        try:
+            _ingredients_ref().document("beans").set({"name": "Зёрна", "stock_quantity": 2000, "unit": "g", "capacity": 2000})
+            _ingredients_ref().document("milk").set({"name": "Молоко", "stock_quantity": 5000, "unit": "ml", "capacity": 5000})
+            _products_ref().document("cappuccino").set({"name": "Капучино", "price": 250})
+            _products_ref().document("espresso").set({"name": "Эспрессо", "price": 150})
+            _recipes_ref().document("cappuccino").set({"items": [
+                {"ingredientId": "beans", "qtyPer": 18},
+                {"ingredientId": "milk",  "qtyPer": 180},
+            ]})
+            _recipes_ref().document("espresso").set({"items": [
+                {"ingredientId": "beans", "qtyPer": 18},
+            ]})
+            st.success("✅ Стартовые данные созданы. Обнови страницу.")
+        except Exception as e:
+            st.error(f"Ошибка создания: {e}")
+
+# вкладки
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Позиции", "Склад", "Рецепты", "Отчёты", "QR-коды"])
+
+# --- Позиции (цветные карточки, состав, подсветка нажатой) ---
+with tab1:
     last_sale_name = st.session_state.get("last_sale_name")
-    last_sale_id   = st.session_state.get("last_sale_id")
+    last_sale_id = st.session_state.get("last_sale_id")
     if last_sale_name:
         st.success(f"Списано: {last_sale_name}", icon="✅")
 
-    prods  = get_products()
-    ingmap = get_ingredients_map()
-
+    prods = get_products()
+    ing_map = get_ingredients_map()
     if not prods:
         st.info("Добавь продукты в Firestore.")
     else:
-        if view_mode == "Карточки":
-            cols_per_row = 3
-            for i in range(0, len(prods), cols_per_row):
-                row = prods[i:i+cols_per_row]
-                cols = st.columns(cols_per_row)
-                for col, p in zip(cols, row):
-                    recipe = get_recipe(p["id"])
-                    is_last = (p["id"] == last_sale_id)
-                    with col:
-                        st.markdown(f'<div class="card {"highlight" if is_last else ""}">', unsafe_allow_html=True)
-                        st.write(f"**{p['name']}** " + (f"<span class='badge'>только что</span>" if is_last else ""), unsafe_allow_html=True)
-                        st.write(f"<div class='price'>{int(p.get('price',0))} ₽</div>", unsafe_allow_html=True)
-                        # состав
-                        if recipe:
-                            lines=[]
-                            for it in recipe:
-                                ing = ingmap.get(it["ingredientId"], {"name":it["ingredientId"], "unit":""})
-                                qty = float(it.get("qtyPer",0))
-                                qty_txt = str(int(qty)) if qty.is_integer() else f"{qty}"
-                                lines.append(f"• {ing['name']}: {qty_txt} {ing['unit']}")
-                            st.write("<div class='caption'>"+"\n".join(lines)+"</div>", unsafe_allow_html=True)
-                        else:
-                            st.write("<div class='caption'>Состав не задан</div>", unsafe_allow_html=True)
-
-                        st.markdown('<div class="grow"></div>', unsafe_allow_html=True)
-                        st.markdown('<div class="big-btn">', unsafe_allow_html=True)
-                        if st.button("Списать", key=f"sell_{p['id']}", use_container_width=True):
-                            err = sell_product(p["id"])
-                            if err: st.error(err)
-                            else:
-                                st.session_state["last_sale_name"] = p["name"]
-                                st.session_state["last_sale_id"]   = p["id"]
-                                st.rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-        else:  # Плитки
-            cols_per_row = 4
-            for i in range(0, len(prods), cols_per_row):
-                row = prods[i:i+cols_per_row]
-                cols = st.columns(cols_per_row)
-                for col, p in zip(cols, row):
-                    with col:
-                        st.markdown('<div class="tile">', unsafe_allow_html=True)
-                        label = f"☕ {p['name']}  ·  <span class='price'>{int(p.get('price',0))} ₽</span>"
-                        clicked = st.button(label, key=f"tile_{p['id']}")
-                        if clicked:
-                            err = sell_product(p["id"])
-                            if err: st.error(err)
-                            else:
-                                st.session_state["last_sale_name"] = p["name"]
-                                st.session_state["last_sale_id"]   = p["id"]
-                                st.rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
+        cols = st.columns(3)
+        for i, p in enumerate(prods):
+            recipe = get_recipe(p["id"])
+            is_last = (p["id"] == last_sale_id)
+            with cols[i % 3]:
+                st.markdown(f'<div class="gy-card {"last" if is_last else ""}">', unsafe_allow_html=True)
+                st.markdown(f"**{p['name']}** — {int(p['price'])} ₽")
+                if recipe:
+                    lines = [format_recipe_line(it, ing_map) for it in recipe]
+                    st.caption("Состав:\n" + "\n".join(lines))
+                else:
+                    st.caption("Состав не задан")
+                if st.button("Списать", key=f"sell_{p['id']}"):
+                    err = sell_product(p["id"])
+                    if err: st.error(err)
+                    else:
+                        st.session_state["last_sale_name"] = p["name"]
+                        st.session_state["last_sale_id"] = p["id"]
+                        st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
 
         st.divider()
         if st.button("↩️ Undo последней продажи"):
@@ -305,138 +415,194 @@ with tab1:
             else:
                 st.success("✅ Откат выполнен.")
                 st.session_state["last_sale_name"] = None
-                st.session_state["last_sale_id"]   = None
+                st.session_state["last_sale_id"] = None
                 st.rerun()
 
-# -------------
-# Склад (объёмы)
-# -------------
+# --- Склад (цветные прогресс-полосы + крупные пополнения) ---
 with tab2:
-    st.subheader("Склад / пополнение")
-    ingmap = get_ingredients_map()
-    if not ingmap:
-        st.info("Нет ингредиентов.")
+    ings = get_ingredients()
+    if not ings:
+        st.info("Нет ингредиентов. Создай тестовые данные выше.")
     else:
-        for ing_id, ing in ingmap.items():
-            cap   = float(ing.get("capacity", 0) or 0)
-            stock = float(ing.get("stock_quantity", 0) or 0)
-            unit  = ing.get("unit","")
+        for ing in ings:
+            cur = ing["stock_quantity"]
+            cap = ing["capacity"] or DEFAULT_CAPACITY.get(ing["id"], 1)
+            pct = percent(cur, cap)
+            unit = ing["unit"]
+            st.markdown('<div class="gy-card">', unsafe_allow_html=True)
+            st.markdown(f"**{ing['name']}** — {pct}% ({int(cur)} / {int(cap)} {unit}) — {status_label(pct)}")
 
-            pct = int(round(stock / cap * 100)) if cap else 0
-            col1, col2, col3, col4 = st.columns([2,2,3,2])
-            with col1:
-                st.write(f"**{ing.get('name', ing_id)}**")
-                st.write(f"Остаток: {int(stock)} {unit} / норма {int(cap)} {unit}")
-            with col2:
-                st.progress(min(pct,100), text=f"{pct}%")
-            with col3:
-                inc = st.number_input(f"Изменить {ing_id}", value=0.0, step=10.0, key=f"chg_{ing_id}")
-                if st.button("Применить", key=f"apply_{ing_id}"):
-                    try:
-                        ref = db.collection(COL_ING).document(ing_id)
-                        s = ref.get().to_dict() or {}
-                        curr = float(s.get("stock_quantity",0.0))
-                        ref.update({"stock_quantity": max(0.0, curr + float(inc))})
-                        st.success("Обновлено.")
-                        time.sleep(0.4)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
-            with col4:
-                # быстрые кнопки
-                c1,c2,c3 = st.columns(3)
-                with c1:
-                    if st.button("+10", key=f"b1_{ing_id}"):
-                        ref = db.collection(COL_ING).document(ing_id); s = ref.get().to_dict() or {}
-                        ref.update({"stock_quantity": float(s.get("stock_quantity",0))+10})
-                        st.rerun()
-                with c2:
-                    if st.button("+100", key=f"b2_{ing_id}"):
-                        ref = db.collection(COL_ING).document(ing_id); s = ref.get().to_dict() or {}
-                        ref.update({"stock_quantity": float(s.get("stock_quantity",0))+100})
-                        st.rerun()
-                with c3:
-                    if st.button("-50", key=f"b3_{ing_id}"):
-                        ref = db.collection(COL_ING).document(ing_id); s = ref.get().to_dict() or {}
-                        ref.update({"stock_quantity": max(0.0, float(s.get("stock_quantity",0))-50)})
-                        st.rerun()
-        st.caption("Подсказка: кнопки справа — быстрое изменение объёмов.")
+            # цветная полоса
+            st.markdown(
+                f"""
+                <div class="gy-bar">
+                  <div class="{pct_class(pct)}" style="width:{pct}%"></div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            c1, c2, c3, c4, c5 = st.columns(5)
+            # крупные шаги для пополнений (зависит от unit)
+            bigs = (200, 500, 1000, 2000) if unit == "ml" else (100, 250, 500, 1000)
+            labels = [f"+{b} {unit}" for b in bigs]
+            for idx, b in enumerate(bigs[:4]):
+                if [c1, c2, c3, c4][idx].button(labels[idx], key=f"repl_{ing['id']}_{b}"):
+                    err = record_supply(ing["id"], b)
+                    if err: st.error(err)
+                    else: st.success("Пополнено ✅"); st.rerun()
 
-# ---------------------
-# РЕЦЕПТЫ — редактировать
-# ---------------------
+            # произвольное пополнение (тоже как поставка)
+            qty = c5.number_input("±", value=0.0, step=1.0, key=f"supply_{ing['id']}")
+            if st.button("Применить", key=f"supply_apply_{ing['id']}"):
+                if qty != 0:
+                    err = record_supply(ing["id"], float(qty))
+                    if err: st.error(err)
+                    else: st.success("Готово"); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+# --- Рецепты (редактор + цена) ---
 with tab3:
-    st.subheader("Рецепты")
     prods = get_products()
+    ing_map = get_ingredients_map()
     if not prods:
-        st.info("Нет продуктов.")
+        st.info("Нет продуктов. Добавь документы в `products`.")
     else:
-        names = {p["name"]:p["id"] for p in prods}
-        sel = st.selectbox("Выбери продукт", list(names.keys()))
-        pid = names[sel]
+        st.caption("Редактируй состав и цены.")
+        for p in prods:
+            with st.expander(f"{p['name']} — рецепт и цена", expanded=False):
+                price_col, save_col = st.columns([3,1])
+                new_price = price_col.number_input("Цена, ₽", min_value=0.0, step=10.0, value=float(p["price"]), key=f"price_{p['id']}")
+                if save_col.button("💾 Сохранить цену", key=f"save_price_{p['id']}"):
+                    err = set_product_price(p["id"], new_price)
+                    if err: st.error(err)
+                    else: st.success("Цена обновлена"); st.rerun()
 
-        current = get_recipe(pid)
-        # приводим к удобному df
-        rows=[]
-        for it in current:
-            rows.append({
-                "ingredientId": it.get("ingredientId",""),
-                "qtyPer": float(it.get("qtyPer",0.0))
-            })
-        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ingredientId","qtyPer"])
+                cur_recipe = get_recipe(p["id"])
+                st.markdown("**Текущий состав:**")
+                if cur_recipe:
+                    for idx, it in enumerate(cur_recipe):
+                        ing_id = it.get("ingredientId")
+                        qty = float(it.get("qtyPer", 0))
+                        meta = ing_map.get(ing_id, {"name": ing_id, "unit": ""})
+                        cols = st.columns([5, 3, 2, 2])
+                        cols[0].write(meta["name"])
+                        new_qty = cols[1].number_input("qty", key=f"qty_{p['id']}_{idx}", value=qty, step=1.0)
+                        if cols[2].button("💾 Сохранить", key=f"save_{p['id']}_{idx}"):
+                            cur_recipe[idx]["qtyPer"] = float(new_qty)
+                            err = set_recipe(p["id"], cur_recipe)
+                            if err: st.error(err)
+                            else: st.success("Сохранено"); st.rerun()
+                        if cols[3].button("🗑 Удалить", key=f"del_{p['id']}_{idx}"):
+                            new_list = [r for i, r in enumerate(cur_recipe) if i != idx]
+                            err = set_recipe(p["id"], new_list)
+                            if err: st.error(err)
+                            else: st.success("Удалено"); st.rerun()
+                else:
+                    st.info("Состав пока не задан.")
 
-        st.write("Ингредиенты и дозировки (qtyPer):")
-        edited = st.data_editor(
-            df,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "ingredientId": st.column_config.TextColumn("Ингредиент ID"),
-                "qtyPer": st.column_config.NumberColumn("Дозировка", step=1.0, format="%.2f"),
-            }
-        )
+                st.markdown("---")
+                st.markdown("**Добавить ингредиент:**")
+                ing_choices = sorted([(v["name"], k) for k, v in ing_map.items()], key=lambda x: x[0].lower())
+                name_to_id = {name: _id for name, _id in ing_choices}
+                select_name = st.selectbox("Ингредиент", [n for n, _ in ing_choices], key=f"add_sel_{p['id']}")
+                add_id = name_to_id.get(select_name)
+                default_unit = ing_map.get(add_id, {}).get("unit", "")
+                add_qty = st.number_input(f"Количество ({default_unit})", min_value=0.0, step=1.0, key=f"add_qty_{p['id']}")
+                if st.button("➕ Добавить в рецепт", key=f"add_btn_{p['id']}"):
+                    new_items = list(cur_recipe) if cur_recipe else []
+                    for item in new_items:
+                        if item.get("ingredientId") == add_id:
+                            item["qtyPer"] = float(add_qty)
+                            break
+                    else:
+                        new_items.append({"ingredientId": add_id, "qtyPer": float(add_qty)})
+                    err = set_recipe(p["id"], new_items)
+                    if err: st.error(err)
+                    else: st.success("Добавлено"); st.rerun()
 
-        colS, colR = st.columns([1,1])
-        with colS:
-            if st.button("💾 Сохранить рецепт"):
-                # валидация
-                items=[]
-                for _, r in edited.iterrows():
-                    iid = str(r.get("ingredientId","")).strip()
-                    qty = float(r.get("qtyPer",0))
-                    if not iid or qty<=0:
-                        continue
-                    items.append({"ingredientId":iid,"qtyPer":qty})
-                db.collection(COL_RECIPES).document(pid).set({"items": items})
-                st.success("Рецепт сохранён.")
-        with colR:
-            if st.button("Очистить рецепт"):
-                db.collection(COL_RECIPES).document(pid).set({"items":[]})
-                st.success("Очищено.")
-                st.rerun()
-
-# -----
-# отчёты (заглушка)
-# -----
+# --- Отчёты ---
 with tab4:
-    st.subheader("Отчёты")
-    st.caption("Здесь позже сделаем: продажи по дням, расход ингредиентов, прогноз закупок.")
-    # простая таблица последних продаж
-    sales = [doc_to_dict(d) for d in db.collection(COL_SALES).order_by("ts", direction=firestore.Query.DESCENDING).limit(20).stream()]
-    if sales:
-        st.write(pd.DataFrame([
-            {"when": s.get("ts"), "productId": s.get("productId"), "ops": s.get("ops")} for s in sales
-        ]))
-    else:
-        st.info("Пока нет продаж.")
+    st.subheader("📊 Отчёты по продажам")
+    today = datetime.now().date()
+    col_from, col_to, col_btn = st.columns([3,3,2])
+    d_from = col_from.date_input("С", value=today)
+    d_to = col_to.date_input("По (включительно)", value=today)
+    start_dt = datetime.combine(d_from, datetime.min.time()).astimezone()
+    end_dt = datetime.combine(d_to, datetime.min.time()).astimezone() + timedelta(days=1)
+    if col_btn.button("Сформировать"):
+        sales = get_sales_between(start_dt, end_dt)
+        if not sales:
+            st.info("Продаж за период нет.")
+        else:
+            df_prod, df_ing = aggregate_sales(sales)
+            prods_map = {p["id"]: p["name"] for p in get_products()}
+            ings_map = get_ingredients_map()
 
-# -----
-# QR-коды (идея)
-# -----
+            if not df_prod.empty:
+                df_prod["product_name"] = df_prod["product_id"].map(lambda x: prods_map.get(x, x))
+                st.markdown("**Продажи по позициям**")
+                st.dataframe(df_prod[["product_name", "count"]].rename(columns={"product_name": "Позиция", "count": "Кол-во"}), hide_index=True, use_container_width=True)
+                st.download_button(
+                    "Скачать CSV (позиции)",
+                    data=df_prod.to_csv(index=False).encode("utf-8"),
+                    file_name=f"sales_by_product_{d_from}_{d_to}.csv",
+                    mime="text/csv",
+                )
+
+            if not df_ing.empty:
+                df_ing["ingredient_name"] = df_ing["ingredient_id"].map(lambda x: ings_map.get(x, {}).get("name", x))
+                df_ing["unit"] = df_ing["ingredient_id"].map(lambda x: ings_map.get(x, {}).get("unit", ""))
+                st.markdown("**Суммарные списания ингредиентов**")
+                st.dataframe(df_ing[["ingredient_name", "qty", "unit"]].rename(columns={"ingredient_name": "Ингредиент", "qty": "Кол-во"}), hide_index=True, use_container_width=True)
+                st.download_button(
+                    "Скачать CSV (ингредиенты)",
+                    data=df_ing.to_csv(index=False).encode("utf-8"),
+                    file_name=f"ingredients_usage_{d_from}_{d_to}.csv",
+                    mime="text/csv",
+                )
+
+# --- QR-коды для пополнений ингредиентов ---
 with tab5:
-    st.subheader("QR-коды (идея)")
-    st.write(
-        "Можно сгенерировать QR, который открывает приложение с параметром ?sell=ID и сразу списывает. "
-        "Это удобно для наклеек на кофемашине.\n\n"
-        "Сейчас это демо-вкладка; если захочешь — добавим генерацию QR и обработку параметров."
-    )
+    st.subheader("📱 QR-коды для пополнений (ингредиенты)")
+    st.caption("Сканируешь — открывается страница с готовым пополнением. Нужен базовый URL твоего приложения (ниже).")
+
+    base_url = base_app_url_input()
+    ings_map = get_ingredients_map()
+    if not base_url:
+        st.info("Введи базовый URL приложения сверху (можно сохранить в secrets как BASE_URL).")
+    else:
+        # выбор ингредиента и пресеты объёмов
+        ing_names = sorted([(v["name"], k) for k, v in ings_map.items()], key=lambda x: x[0].lower())
+        name_to_id = {n: i for n, i in ing_names}
+        col_i, col_p = st.columns([2, 2])
+        ing_name = col_i.selectbox("Ингредиент", [n for n, _ in ing_names])
+        ing_id = name_to_id[ing_name]
+        unit = ings_map.get(ing_id, {}).get("unit", "ml")
+        presets = (200, 500, 1000, 2000) if unit == "ml" else (100, 250, 500, 1000)
+
+        st.markdown("**Сгенерируй QR для пресетов:**")
+        qr_cols = st.columns(4)
+        for idx, q in enumerate(presets):
+            url = f"{base_url}?restock={ing_id}&qty={q}"
+            # генерим QR
+            img = qrcode.make(url)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            qr_cols[idx].image(buf.getvalue(), caption=f"+{q} {unit}", use_column_width=True)
+            qr_cols[idx].download_button(
+                label=f"Скачать +{q}{unit}",
+                data=buf.getvalue(),
+                file_name=f"qr_{ing_id}_{q}{unit}.png",
+                mime="image/png",
+                key=f"dl_qr_{ing_id}_{q}"
+            )
+
+        st.markdown("---")
+        st.markdown("**Или свой объём:**")
+        custom_qty = st.number_input(f"Количество ({unit})", min_value=1.0, step=1.0, value=float(presets[0]))
+        url = f"{base_url}?restock={ing_id}&qty={int(custom_qty) if custom_qty.is_integer() else custom_qty}"
+        img = qrcode.make(url)
+        buf2 = io.BytesIO(); img.save(buf2, format="PNG")
+        st.image(buf2.getvalue(), caption=f"QR: +{custom_qty} {unit} для {ing_name}", use_column_width=False)
+        st.code(url, language="text")
+        st.download_button("Скачать QR (кастом)", data=buf2.getvalue(), file_name=f"qr_{ing_id}_{int(custom_qty)}{unit}.png", mime="image/png")
