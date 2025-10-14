@@ -12,39 +12,45 @@ from firebase_admin import credentials
 
 # ============== Firestore init (секреты) =================
 
-def _read_firebase_service_account() -> Dict[str, Any]:
+def _read_firebase_service_account() -> Dict:
     """
-    Берём сервисный ключ из st.secrets.
-    Поддерживаются 2 формата:
-      1) TOML-таблица [FIREBASE_SERVICE_ACCOUNT] (ключи как поля)
-      2) JSON-строка FIREBASE_SERVICE_ACCOUNT (вся JSON строка целиком)
+    Поддерживает два формата Secrets:
+      A) TOML-таблица:
+         [FIREBASE_SERVICE_ACCOUNT]
+         type="service_account"
+         ...
+         private_key = """-----BEGIN... (с реальными переводами строк) ... END-----"""
+      B) JSON-строка:
+         FIREBASE_SERVICE_ACCOUNT = "{\"type\":\"service_account\",...,\"private_key\":\"-----BEGIN...\\n...\\nEND-----\\n\"}"
     """
     if "FIREBASE_SERVICE_ACCOUNT" not in st.secrets:
         raise RuntimeError("В Secrets отсутствует FIREBASE_SERVICE_ACCOUNT.")
 
     svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
 
-    # Вариант 1: таблица TOML -> dict
-    if isinstance(svc, dict):
-        data = dict(svc)
-    # Вариант 2: JSON-строка
-    elif isinstance(svc, str):
+    # Вариант B: JSON-строка
+    if isinstance(svc, str):
         try:
             data = json.loads(svc)
         except Exception:
-            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
-    else:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
+            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой (валидный JSON) или таблицей TOML.")
+        # если в ключе литералы \n — превращаем в реальные переводы строк
+        pk = data.get("private_key", "")
+        if "\\n" in pk and "\n" not in pk:
+            data["private_key"] = pk.replace("\\n", "\n")
+        return data
 
-    # небольшой хелпер-диагностика
-    pk: str = data.get("private_key", "")
-    if not (pk.startswith("-----BEGIN PRIVATE KEY-----") and "\\n" in pk):
-        raise RuntimeError(
-            "Не удалось обработать сервисный ключ. Чаще всего дело в формате private_key.\n"
-            "JSON-формат: ключ одной строкой, с символами \\n внутри.\n"
-            "TOML-формат: многострочно, без \\n внутри (как есть)."
-        )
-    return data
+    # Вариант A: таблица TOML (dict)
+    if isinstance(svc, dict):
+        data = dict(svc)
+        pk = data.get("private_key", "")
+        # Для TOML всё должно уже быть многострочно — НИЧЕГО не меняем.
+        # Лёгкая валидация шапки:
+        if not str(pk).startswith("-----BEGIN PRIVATE KEY-----"):
+            raise RuntimeError("private_key (TOML) должен начинаться с -----BEGIN PRIVATE KEY-----")
+        return data
+
+    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT должен быть JSON-строкой или таблицей TOML.")
 
 
 @st.cache_resource(show_spinner=False)
