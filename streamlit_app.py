@@ -400,6 +400,7 @@ with left:
             st.session_state["selected_size"] = "M"
             st.session_state["qty"] = 1
 
+    
     st.markdown("---")
 
     # --- Параметры выбранного напитка ---
