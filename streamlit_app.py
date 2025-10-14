@@ -268,6 +268,12 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["Позиции", "Склад", "Рец�
 # TAB 1 — Позиции (крупные карточки, ярко)
 # -------------------------
 with tab1:
+    # режим отображения: карточки / плитки
+    try:
+        view_mode = st.segmented_control("Вид", options=["Карточки", "Плитки"], default="Карточки")
+    except Exception:
+        view_mode = st.radio("Вид", ["Карточки", "Плитки"], horizontal=True, index=0)
+
     last_sale_name = st.session_state.get("last_sale_name")
     last_sale_id = st.session_state.get("last_sale_id")
     if last_sale_name:
@@ -275,37 +281,39 @@ with tab1:
 
     prods = get_products()
     ing_map = get_ingredients_map()
+
     if not prods:
         st.info("Добавь продукты в Firestore.")
     else:
-        cols_per_row = 3
-        for i in range(0, len(prods), cols_per_row):
-            row = prods[i:i+cols_per_row]
-            cols = st.columns(cols_per_row)
-            for col, p in zip(cols, row):
-                recipe = get_recipe(p["id"])
-                is_last = (p["id"] == last_sale_id)
-                with col:
-                    st.markdown(f'<div class="card {"highlight" if is_last else ""}">', unsafe_allow_html=True)
-                    st.write(f"**{p['name']}** " + ("<span class='badge'>только что</span>" if is_last else ""), unsafe_allow_html=True)
-                    st.write(f"<span class='price'>{int(p['price'])} ₽</span>", unsafe_allow_html=True)
-                    if recipe:
-                        lines = []
-                        for it in recipe:
-                            ing = ing_map.get(it["ingredientId"], {"name": it["ingredientId"], "unit": ""})
-                            qty = float(it.get("qtyPer", 0))
-                            qty_text = str(int(qty)) if qty.is_integer() else f"{qty}"
-                            lines.append(f"• {ing['name']}: {qty_text} {ing['unit']}")
-                        st.write(f"<div class='caption'>{chr(10).join(lines)}</div>", unsafe_allow_html=True)
-                    else:
-                        st.write("<div class='caption'>Состав не задан</div>", unsafe_allow_html=True)
+        if view_mode == "Карточки":
+            cols_per_row = 3
+            for i in range(0, len(prods), cols_per_row):
+                row = prods[i:i+cols_per_row]
+                cols = st.columns(cols_per_row)
+                for col, p in zip(cols, row):
+                    recipe = get_recipe(p["id"])
+                    is_last = (p["id"] == last_sale_id)
+                    with col:
+                        st.markdown(f'<div class="card {"highlight" if is_last else ""}">', unsafe_allow_html=True)
+                        st.write(f"**{p['name']}** " + ("<span class='badge'>только что</span>" if is_last else ""), unsafe_allow_html=True)
+                        st.write(f"<span class='price'>{int(p['price'])} ₽</span>", unsafe_allow_html=True)
 
-                    # Большая кнопка
-                    key = f"sell_{p['id']}"
-                    container = st.container()
-                    with container:
+                        # состав
+                        if recipe:
+                            lines = []
+                            for it in recipe:
+                                ing = ing_map.get(it["ingredientId"], {"name": it["ingredientId"], "unit": ""})
+                                qty = float(it.get("qtyPer", 0))
+                                qty_text = str(int(qty)) if qty.is_integer() else f"{qty}"
+                                lines.append(f"• {ing['name']}: {qty_text} {ing['unit']}")
+                            st.write("<div class='caption'>" + "\n".join(lines) + "</div>", unsafe_allow_html=True)
+                        else:
+                            st.write("<div class='caption'>Состав не задан</div>", unsafe_allow_html=True)
+
+                        # растягиваем вверх, кнопку — вниз
+                        st.markdown('<div class="grow"></div>', unsafe_allow_html=True)
                         st.markdown('<div class="big-btn">', unsafe_allow_html=True)
-                        if st.button("Списать", key=key, use_container_width=True):
+                        if st.button("Списать", key=f"sell_{p['id']}", use_container_width=True):
                             err = sell_product(p["id"])
                             if err: st.error(err)
                             else:
@@ -313,7 +321,26 @@ with tab1:
                                 st.session_state["last_sale_id"] = p["id"]
                                 st.rerun()
                         st.markdown('</div>', unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+        else:  # ===== ПЛИТКИ =====
+            cols_per_row = 4
+            for i in range(0, len(prods), cols_per_row):
+                row = prods[i:i+cols_per_row]
+                cols = st.columns(cols_per_row)
+                for col, p in zip(cols, row):
+                    with col:
+                        st.markdown('<div class="tile">', unsafe_allow_html=True)
+                        label = f"☕ {p['name']}  ·  <span class='price'>{int(p['price'])} ₽</span>"
+                        clicked = st.button(label, key=f"tile_{p['id']}")
+                        if clicked:
+                            err = sell_product(p["id"])
+                            if err: st.error(err)
+                            else:
+                                st.session_state["last_sale_name"] = p["name"]
+                                st.session_state["last_sale_id"] = p["id"]
+                                st.rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
 
         st.divider()
         if st.button("↩️ Undo последней продажи"):
