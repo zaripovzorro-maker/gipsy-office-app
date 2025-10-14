@@ -19,7 +19,7 @@ def _read_firebase_service_account() -> Dict:
          [FIREBASE_SERVICE_ACCOUNT]
          type="service_account"
          ...
-         
+         private_key = """-----BEGIN... (с реальными переводами строк) ... END-----"""
       B) JSON-строка:
          FIREBASE_SERVICE_ACCOUNT = "{\"type\":\"service_account\",...,\"private_key\":\"-----BEGIN...\\n...\\nEND-----\\n\"}"
     """
