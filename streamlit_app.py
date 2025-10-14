@@ -13,11 +13,14 @@ from firebase_admin import credentials
 from google.cloud import firestore
 
 
-# -----------------------------
-# Firestore init (через Secrets)
-# -----------------------------
+# =========================
+# Firestore init (умный)
+# =========================
 def init_firestore() -> firestore.Client:
+    st.sidebar.markdown("### 🔐 Secrets check")
+
     project_id = st.secrets.get("PROJECT_ID", "").strip()
+    st.sidebar.write("• PROJECT_ID present:", bool(project_id))
     if not project_id:
         st.error("В Secrets нет PROJECT_ID.")
         st.stop()
@@ -27,110 +30,121 @@ def init_firestore() -> firestore.Client:
         st.error("В Secrets нет FIREBASE_SERVICE_ACCOUNT.")
         st.stop()
 
+    # Преобразуем к dict и «лечим» private_key
+    data = None
+    raw_type = type(svc_raw).__name__
+    st.sidebar.write("• FIREBASE_SERVICE_ACCOUNT type:", raw_type)
+
+    if isinstance(svc_raw, str):
+        text = svc_raw.strip()
+        # Если строка — пытаемся распарсить как JSON
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            st.error(
+                "FIREBASE_SERVICE_ACCOUNT задан как строка, но это не валидный JSON. "
+                "Убедись, что вся JSON-структура в одну строку, а в private_key стоят **двойные слеши** `\\\\n`."
+            )
+            st.stop()
+    else:
+        # TOML-таблица → сразу dict
+        data = dict(svc_raw)
+
+    # Мини-проверки ключа
+    pk = data.get("private_key", "")
+    st.sidebar.write("• private_key length:", len(pk))
+    st.sidebar.write("• starts with BEGIN:", str(pk).startswith("-----BEGIN PRIVATE KEY"))
+    st.sidebar.write("• contains \\n literal:", "\\n" in pk)
+
+    # firebase_admin ждёт реальный перевод строк в ключе
+    if "\\n" in pk and "\n" not in pk:
+        data["private_key"] = pk.replace("\\n", "\n")
+
+    # Ещё раз «BEGIN» после замены
+    if not str(data.get("private_key", "")).startswith("-----BEGIN PRIVATE KEY"):
+        st.error(
+            "Не удалось обработать сервисный ключ. "
+            "Чаще всего это из-за формата `private_key`. "
+            "• JSON-вариант: одна строка, внутри ключа должны быть `\\\\n`.\n"
+            "• TOML-вариант: многострочно (реальные переводы строк), **без** `\\\\n` внутри."
+        )
+        st.stop()
+
+    # init firebase_admin (один раз)
     if not firebase_admin._apps:
-        if isinstance(svc_raw, str):
-            try:
-                data = json.loads(svc_raw)
-            except Exception:
-                st.error(
-                    "Ключ в Secrets задан как строка, но это не валидный JSON. "
-                    "Убедись, что в `private_key` используются `\\n`, а не настоящие переводы строк."
-                )
-                st.stop()
-        else:
-            data = dict(svc_raw)
+        try:
+            cred = credentials.Certificate(data)
+        except Exception as err:
+            st.error(f"Не удалось создать credentials.Certificate: {err}")
+            st.stop()
+        try:
+            firebase_admin.initialize_app(cred, {"projectId": project_id})
+        except Exception as err:
+            st.error(f"Не удалось инициализировать firebase_admin: {err}")
+            st.stop()
 
-        cred = credentials.Certificate(data)
-        firebase_admin.initialize_app(cred, {"projectId": project_id})
+    try:
+        client = firestore.Client(project=project_id)
+    except Exception as err:
+        st.error(f"Не удалось создать Firestore Client: {err}")
+        st.stop()
 
-    return firestore.Client(project=project_id)
+    return client
 
 
 db: firestore.Client = init_firestore()
 
 
-# -----------------------------
-# UI общие настройки + мягкая тема
-# -----------------------------
-st.set_page_config(
-    page_title="gipsy office — учёт",
-    page_icon="☕",
-    layout="wide",
-)
+# =========================
+# UI базовые стили
+# =========================
+st.set_page_config(page_title="gipsy office — учёт", page_icon="☕", layout="wide")
 
 st.markdown(
     """
     <style>
-      /* базовые цвета */
       :root {
-        --card-bg: #ffffff;
-        --card-br: #e5e7eb;
-        --card-hv: #f8fafc;
+        --card:#ffffff; --br:#e5e7eb; --hv:#f8fafc;
         --pill-bg:#eef2ff; --pill-br:#c7d2fe; --pill-tx:#3730a3;
         --accent:#6366f1; --accent-weak:#eef2ff; --muted:#6b7280; --ink:#111827;
-        --ok:#065f46; --warn:#b45309; --bad:#b91c1c;
       }
-
-      .note{
-        background:#fff7e5;border:1px solid #ffe2a8;border-radius:12px;
-        padding:.6rem 1rem;color:#6d5400;font-size:.9rem;margin:.4rem 0 1rem;
-      }
-
-      .muted{color:var(--muted)}
-      .price{color:var(--ink);font-weight:700}
-
-      .pill{
-        display:inline-block;background:var(--pill-bg);color:var(--pill-tx);
-        border:1px solid var(--pill-br);border-radius:999px;
-        padding:4px 12px;font-size:.8rem
-      }
-
-      .tile, .tile-sel{
-        background:var(--card-bg);border:1px solid var(--card-br);
-        border-radius:16px;padding:14px; transition:.12s;
-      }
-      .tile:hover{background:var(--card-hv)}
-      .tile-sel{ border:2px solid var(--accent); background:var(--accent-weak) }
-
-      .stButton>button{
-        width:100%;border-radius:12px;border:1px solid var(--card-br);
-        padding:10px 12px;background:var(--card-bg)
-      }
-      .stButton>button:hover{border-color:#cbd5e1;background:var(--card-hv)}
-
-      .cart{
-        background:#f8fafc;border:1px solid var(--card-br);border-radius:16px;padding:1rem
-      }
-      .good{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+      .note{background:#fff7e5;border:1px solid #ffe2a8;border-radius:12px;
+            padding:.6rem 1rem;color:#6d5400;font-size:.9rem;margin:.4rem 0 1rem;}
+      .muted{color:var(--muted)} .price{color:var(--ink);font-weight:700}
+      .tile, .tile-sel{background:var(--card);border:1px solid var(--br);
+        border-radius:16px;padding:14px; transition:.12s;}
+      .tile:hover{background:var(--hv)} .tile-sel{border:2px solid var(--accent);background:var(--accent-weak)}
+      .stButton>button{width:100%;border-radius:12px;border:1px solid var(--br);padding:10px 12px;background:var(--card)}
+      .stButton>button:hover{border-color:#cbd5e1;background:var(--hv)}
+      .cart{background:#f8fafc;border:1px solid var(--br);border-radius:16px;padding:1rem}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-# -----------------------------
+# =========================
 # Firestore helpers
-# -----------------------------
+# =========================
 def get_products() -> List[Dict]:
-    docs = db.collection("products").stream()
-    res = []
-    for d in docs:
+    items = []
+    for d in db.collection("products").stream():
         v = d.to_dict()
         v["id"] = d.id
         v.setdefault("category", "Разное")
         v.setdefault("price", 0)
         v.setdefault("active", True)
         if v["active"]:
-            res.append(v)
-    return res
+            items.append(v)
+    return items
 
 
 def get_recipes() -> Dict[str, Dict[str, float]]:
-    res: Dict[str, Dict[str, float]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for d in db.collection("recipes").stream():
         v = d.to_dict()
-        res[d.id] = v.get("ingredients", {})
-    return res
+        out[d.id] = v.get("ingredients", {})
+    return out
 
 
 def get_ingredients() -> Dict[str, Dict]:
@@ -153,8 +167,7 @@ def adjust_stock(transaction, ingredient_id: str, delta: float):
 def sell_tx(items: List[Tuple[str, int]], recipes: Dict[str, Dict[str, float]]):
     def _tx(transaction):
         for pid, qty in items:
-            ings = recipes.get(pid, {})
-            for ing_id, dose in ings.items():
+            for ing_id, dose in recipes.get(pid, {}).items():
                 adjust_stock(transaction, ing_id, -dose * qty)
         db.collection("sales").add(
             {"timestamp": firestore.SERVER_TIMESTAMP, "items": [{"pid": p, "qty": q} for p, q in items]}
@@ -163,9 +176,9 @@ def sell_tx(items: List[Tuple[str, int]], recipes: Dict[str, Dict[str, float]]):
     db.transaction()(_tx)
 
 
-# -----------------------------
+# =========================
 # Session
-# -----------------------------
+# =========================
 if "cart" not in st.session_state:
     st.session_state.cart: Dict[str, int] = {}
 
@@ -173,18 +186,15 @@ if "ui" not in st.session_state:
     st.session_state.ui = {"category": None, "last_clicked": None}
 
 
-# -----------------------------
+# =========================
 # Навигация
-# -----------------------------
-page = st.sidebar.radio(
-    "Навигация",
-    ["Продажи", "Склад", "Рецепты", "Поставки"],
-    index=0,
-)
+# =========================
+page = st.sidebar.radio("Навигация", ["Продажи", "Склад", "Рецепты", "Поставки"], index=0)
 
-# =============================
+
+# =========================
 # Продажи
-# =============================
+# =========================
 if page == "Продажи":
     st.title("gipsy office — продажи")
     st.markdown('<div class="note">Продажа проводится только при нажатии <b>«Купить»</b>. До этого позиции лежат в корзине и остатки не меняются.</div>', unsafe_allow_html=True)
@@ -192,8 +202,7 @@ if page == "Продажи":
     products = get_products()
     recipes = get_recipes()
 
-    # Категории
-    groups: Dict[str, List[Dict]] = defaultdict(list)
+    groups = defaultdict(list)
     for p in products:
         groups[p["category"]].append(p)
     cats = sorted(groups.keys())
@@ -204,7 +213,6 @@ if page == "Продажи":
     with right:
         st.subheader("🧺 Корзина")
         st.markdown('<div class="cart">', unsafe_allow_html=True)
-
         if st.session_state.cart:
             total = 0.0
             for pid, qty in st.session_state.cart.items():
@@ -224,45 +232,36 @@ if page == "Продажи":
                 with c3:
                     if st.button("+", key=f"plus_{pid}"):
                         st.session_state.cart[pid] = qty + 1
-
             st.markdown("---")
             st.markdown(f"**Итого:** <span class='price'>{total:.0f} ₽</span>", unsafe_allow_html=True)
             if st.button("Купить ✅", type="primary", use_container_width=True):
                 items = [(pid, q) for pid, q in st.session_state.cart.items() if q > 0]
-                if not items:
-                    st.warning("Корзина пуста.")
-                else:
-                    try:
-                        sell_tx(items, recipes)
-                        st.session_state.cart.clear()
-                        st.success("Продажа проведена, склад списан.")
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
+                try:
+                    sell_tx(items, recipes)
+                    st.session_state.cart.clear()
+                    st.success("Продажа проведена, склад списан.")
+                except Exception as e:
+                    st.error(f"Ошибка при продаже: {e}")
         else:
             st.info("Корзина пуста. Добавьте напитки слева.")
-
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Категории + плитки напитков
+    # Категории + плитки
     with left:
         st.subheader("Категории")
         tag_cols = st.columns(min(6, max(1, len(cats)))) if cats else [st]
         for i, cat in enumerate(cats):
             with tag_cols[i % len(tag_cols)]:
-                selected = st.session_state.ui["category"] == cat
-                cls = "pill" if not selected else "pill"
-                if st.button(f"{cat}", key=f"cat_{cat}"):
+                if st.button(cat, key=f"cat_{cat}"):
                     st.session_state.ui["category"] = cat
 
         st.markdown("---")
         cur_cat = st.session_state.ui["category"] or (cats[0] if cats else None)
         st.subheader(f"Напитки — {cur_cat or '—'}")
         cur_list = groups.get(cur_cat, [])
-
         if not cur_list:
             st.info("В этой категории пока нет активных позиций.")
         else:
-            # плитки в 4 колонки
             cols = st.columns(4)
             for i, prod in enumerate(cur_list):
                 col = cols[i % 4]
@@ -277,9 +276,10 @@ if page == "Продажи":
                         st.session_state.ui["last_clicked"] = prod["id"]
                     st.markdown("</div>", unsafe_allow_html=True)
 
-# =============================
+
+# =========================
 # Склад
-# =============================
+# =========================
 elif page == "Склад":
     st.title("Склад")
     ings = get_ingredients()
@@ -300,9 +300,10 @@ elif page == "Склад":
         )
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-# =============================
+
+# =========================
 # Рецепты
-# =============================
+# =========================
 elif page == "Рецепты":
     st.title("Рецепты")
     products = get_products()
@@ -334,7 +335,6 @@ elif page == "Рецепты":
                         cur.pop(ing_id, None)
                         db.collection("recipes").document(pid).set({"ingredients": cur}, merge=True)
                         st.experimental_rerun()
-                # если поменяли дозу — сохраняем
                 if new_dose != dose:
                     cur[ing_id] = float(new_dose)
                     db.collection("recipes").document(pid).set({"ingredients": cur}, merge=True)
@@ -355,9 +355,10 @@ elif page == "Рецепты":
             st.success("Обновлено.")
             st.experimental_rerun()
 
-# =============================
-# Поставки (светлая форма)
-# =============================
+
+# =========================
+# Поставки
+# =========================
 elif page == "Поставки":
     st.title("Поставки (ингредиенты)")
     ings = get_ingredients()
