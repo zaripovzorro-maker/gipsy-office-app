@@ -1,29 +1,30 @@
-from __future__ import annotations
-from typing import Dict, Any, List, Tuple
+from typing import Dict
 from google.cloud import firestore
 
-# products/{productId}
-# {
-#   name: str, category: str, volumes: [200, 400],
-#   base_price: int (копейки),
-#   addons: [{id, name, price_delta:int, ingredients:{ingredientId: qty}}],
-#   recipe_ref: "recipes/{id}",
-#   is_active: bool
-# }
 
-def list_categories(db: firestore.Client) -> List[str]:
-    docs = db.collection("products").where("is_active", "==", True).stream()
-    return sorted({ (d.to_dict().get("category") or "Без категории") for d in docs })
+def fetch_recipes(db: firestore.Client) -> Dict[str, dict]:
+    rec: Dict[str, dict] = {}
+    for doc in db.collection("recipes").stream():
+        d = doc.to_dict() or {}
+        rec[doc.id] = {
+            "id": doc.id,
+            "base_volume_ml": float(d.get("base_volume_ml", 200)),
+            "ingredients": d.get("ingredients", []),  # [{ingredient_id, qty, unit}]
+        }
+    return rec
 
-def list_products_by_category(db: firestore.Client, category: str) -> List[Tuple[str, Dict[str,Any]]]:
-    q = db.collection("products").where("is_active","==",True).where("category","==",category)
-    return [(d.id, d.to_dict()) for d in q.stream()]
 
-def load_recipe(db: firestore.Client, recipe_ref: str) -> Dict[str,Any] | None:
-    # recipe_ref вида "recipes/xxx"
-    parts = recipe_ref.split("/")
-    if len(parts) != 2:
-        return None
-    d = db.collection(parts[0]).document(parts[1]).get()
-    return d.to_dict() if d.exists else None
-
+def fetch_products(db: firestore.Client) -> Dict[str, dict]:
+    prods: Dict[str, dict] = {}
+    for doc in db.collection("products").where("is_active", "==", True).stream():
+        d = doc.to_dict() or {}
+        prods[doc.id] = {
+            "id": doc.id,
+            "name": d.get("name", doc.id),
+            "category": d.get("category", "Прочее"),
+            "volumes": d.get("volumes", [200]),
+            "base_price": int(d.get("base_price", 0)),
+            "addons": d.get("addons", []),  # [{id,name,price_delta,ingredients:{}}]
+            "recipe_ref": d.get("recipe_ref", None),  # 'recipes/xxx' или reference
+        }
+    return prods
