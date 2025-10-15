@@ -138,6 +138,45 @@ def main():
         with st.sidebar.expander("📁 Текущее дерево проекта (top)", expanded=False):
             for line in list_repo_tree():
                 st.text(line)
-        st.sidebar.markdown(
-            """
-**Как должно быть в репозитории (всё в корне):**
+
+        # безопасно вставляем подсказку с помощью st.sidebar.write вместо тройных кавычек
+        st.sidebar.write(
+            "**Как должно быть в репозитории (всё в корне):**\n"
+            "```\n"
+            "streamlit_app.py\n"
+            "app/\n"
+            "  __init__.py\n"
+            "  ui_sale.py\n"
+            "  ui_inventory.py\n"
+            "  ui_reports.py\n"
+            "  services/\n"
+            "    __init__.py\n"
+            "    firestore_client.py\n"
+            "    inventory.py\n"
+            "    products.py\n"
+            "    sales.py\n"
+            "  logic/\n"
+            "    __init__.py\n"
+            "    calc.py\n"
+            "    thresholds.py\n"
+            "  utils/\n"
+            "    __init__.py\n"
+            "    format.py\n"
+            "```\n"
+            "⚙️ Убедись, что:\n"
+            "- `app/` находится рядом со `streamlit_app.py`\n"
+            "- В каждой папке есть пустой `__init__.py`\n"
+            "- Имена файлов совпадают (регистр букв важен)"
+        )
+
+    st.divider()
+    if page == "Продажи":
+        render_sale(db)
+    elif page == "Склад":
+        render_inventory(db)
+    else:
+        render_reports(db)
+
+
+if __name__ == "__main__":
+    main()
