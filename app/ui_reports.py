@@ -1,28 +1,40 @@
-from __future__ import annotations
 import streamlit as st
 from google.cloud import firestore
 
+from app.services.inventory import fetch_inventory
+from app.logic.thresholds import inv_status
+from app.utils.format import fmt_money_kop
+
+
 def render_reports(db: firestore.Client):
-    st.subheader("Отчёты (MVP)")
+    st.subheader("Рецепты • Отчёты (MVP)")
 
-    st.markdown("**Скоро закончится** (🟠/🔴)")
-    low = []
-    for d in db.collection("inventory").stream():
-        v = d.to_dict(); cap = float(v.get("capacity") or 0) or 1.0
-        cur = float(v.get("current") or 0)
-        ratio = cur / cap if cap > 0 else 0
-        if ratio < 0.5:
-            low.append((v.get("name", d.id), ratio))
-    if low:
-        for name, r in sorted(low, key=lambda x:x[1]):
-            st.write(f"• {name}: {int(r*100)}%")
-    else:
-        st.write("Нет позиций в зоне риска.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("Последние 30 продаж:")
+        sales = list(
+            db.collection("sales")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(30)
+            .stream()
+        )
+        if not sales:
+            st.info("Пока нет продаж.")
+        else:
+            for s in sales:
+                d = s.to_dict()
+                st.write(f"- **{fmt_money_kop(int(d.get('total_amount',0)))}**, позиций: {len(d.get('items',[]))}")
 
-    st.markdown("---")
-    st.markdown("**Последние продажи**")
-    sales = db.collection("sales").order_by("created_at", direction=firestore.Query.DESCENDING).limit(20).stream()
-    for s in sales:
-        v = s.to_dict()
-        st.write(f"- {v.get('created_at')} — {v.get('total_amount',0)/100:.0f} ₽, позиций: {len(v.get('items',[]))}")
-
+    with col2:
+        st.caption("Ингредиенты на исходе (🟠/🔴):")
+        inv = fetch_inventory(db)
+        danger = []
+        for x in inv.values():
+            icon, ratio = inv_status(x["capacity"], x["current"])
+            if icon in ("🟠", "🔴"):
+                danger.append(f"{icon} {x['name']} — {x['current']}/{x['capacity']} {x['unit']}")
+        if not danger:
+            st.success("Критичных остатков нет.")
+        else:
+            for line in danger:
+                st.write("• " + line)
