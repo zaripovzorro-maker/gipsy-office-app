@@ -1,36 +1,93 @@
 import os
 import sys
 import json
+import importlib
+import importlib.util
+from types import ModuleType
 import streamlit as st
 
-# гарантируем, что корень репозитория в пути поиска модулей
+# ---------- утилиты динамической загрузки ----------
+
 ROOT = os.path.dirname(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# 🧩 добавляем путь на случай, если app/ находится во вложенной папке
-sys.path.append(os.path.join(ROOT, "gipsy-office-app"))
+def _repo_tree(max_lines=300):
+    rows = []
+    for root, dirs, files in os.walk(ROOT):
+        if len(rows) >= max_lines:
+            rows.append("… (truncated)")
+            break
+        rel = os.path.relpath(root, ROOT)
+        rows.append(f"[DIR] {'.' if rel == '.' else rel}")
+        for f in files:
+            rows.append(f"     └─ {f}")
+    return "\n".join(rows)
 
-# ===== Пытаемся импортнуть модульные экранчики =====
-USE_FALLBACK = False
-try:
-    from app.services.firestore_client import get_db as _get_db
-    from app.ui_sale import render_sale as _render_sale
-    from app.ui_inventory import render_inventory as _render_inventory
-    from app.ui_reports import render_reports as _render_reports
-except Exception as e:
-    USE_FALLBACK = True
-    IMPORT_ERR = e
+def _find_file(filename: str) -> str | None:
+    """Рекурсивно ищет первый попавшийся файл с таким именем внутри репо."""
+    for root, _, files in os.walk(ROOT):
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
 
-# ===== Общие утилиты =====
-from google.cloud import firestore
-from google.oauth2 import service_account
+def _load_module_from_path(mod_name: str, file_path: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot create spec for {mod_name} at {file_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    sys.modules[mod_name] = mod
+    return mod
 
+def _safe_import():
+    """
+    1) пытаемся обычные импорты пакета app.*
+    2) если не вышло — ищем файлы по имени и подгружаем напрямую
+    """
+    try:
+        from app.services.firestore_client import get_db as get_db  # type: ignore
+        from app.ui_sale import render_sale                       # type: ignore
+        from app.ui_inventory import render_inventory             # type: ignore
+        from app.ui_reports import render_reports                 # type: ignore
+        return get_db, render_sale, render_inventory, render_reports, None
+    except Exception as e:
+        # План Б: загружаем по путям файлов
+        try:
+            fc_path = _find_file("firestore_client.py")
+            s_path  = _find_file("ui_sale.py")
+            i_path  = _find_file("ui_inventory.py")
+            r_path  = _find_file("ui_reports.py")
+
+            missing = [n for n, p in [
+                ("firestore_client.py", fc_path),
+                ("ui_sale.py", s_path),
+                ("ui_inventory.py", i_path),
+                ("ui_reports.py", r_path),
+            ] if p is None]
+            if missing:
+                msg = "Не нашёл файлы: " + ", ".join(missing)
+                raise ImportError(msg)
+
+            fc_mod = _load_module_from_path("dyn_firestore_client", fc_path)  # type: ignore
+            s_mod  = _load_module_from_path("dyn_ui_sale", s_path)            # type: ignore
+            i_mod  = _load_module_from_path("dyn_ui_inventory", i_path)       # type: ignore
+            r_mod  = _load_module_from_path("dyn_ui_reports", r_path)         # type: ignore
+
+            get_db = getattr(fc_mod, "get_db")
+            render_sale = getattr(s_mod, "render_sale")
+            render_inventory = getattr(i_mod, "render_inventory")
+            render_reports = getattr(r_mod, "render_reports")
+            return get_db, render_sale, render_inventory, render_reports, None
+        except Exception as e2:
+            return None, None, None, None, (e, e2)
+
+# ---------- проверка secrets ----------
 
 def sidebar_secrets_check():
     with st.sidebar.expander("🔍 Secrets check", expanded=False):
-        svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
         st.write("PROJECT_ID present:", bool(st.secrets.get("PROJECT_ID")))
+        svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
         st.write("FIREBASE_SERVICE_ACCOUNT type:", type(svc).__name__)
         if isinstance(svc, str):
             st.write("contains \\n literal:", "\\n" in svc)
@@ -49,80 +106,25 @@ def sidebar_secrets_check():
                 str(svc.get("private_key", "")).strip().startswith("-----BEGIN"),
             )
 
+# ---------- фоллбэки экранов ----------
 
-def list_repo_tree(max_entries=300):
-    rows = []
-    for root, dirs, files in os.walk(ROOT):
-        if len(rows) > max_entries:
-            rows.append("… (truncated)")
-            break
-        rel = os.path.relpath(root, ROOT)
-        rows.append(f"[DIR] {'.' if rel == '.' else rel}")
-        for f in files:
-            rows.append(f"     └─ {f}")
-    return rows
-
-
-# ===== Фоллбэк Firestore =====
-@st.cache_resource
-def get_db_fallback() -> firestore.Client:
-    project_id = st.secrets.get("PROJECT_ID")
-    svc = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
-    if not project_id:
-        st.error("❌ В secrets отсутствует PROJECT_ID.")
-        st.stop()
-    if not svc:
-        st.error("❌ В secrets отсутствует FIREBASE_SERVICE_ACCOUNT.")
-        st.stop()
-    try:
-        info = json.loads(svc) if isinstance(svc, str) else dict(svc)
-        creds = service_account.Credentials.from_service_account_info(info)
-        db = firestore.Client(credentials=creds, project=project_id)
-        _ = list(db.collections())
-        return db
-    except Exception as e:
-        st.error(f"Не удалось инициализировать Firestore: {e}")
-        st.stop()
-
-
-# ===== Фоллбэк-экраны =====
-def render_sale_fallback(db: firestore.Client):
+def render_sale_fallback(*_):
     st.subheader("Продажи (fallback)")
-    st.info("Модули `app/...` не найдены. Снизу — подсказка, как исправить структуру.")
+    st.info("UI-модуль не найден. Ниже подсказки по структуре.")
 
-
-def render_inventory_fallback(db: firestore.Client):
+def render_inventory_fallback(*_):
     st.subheader("Склад (fallback)")
-    st.write("Firestore подключён, но UI-модуль не найден.")
 
-
-def render_reports_fallback(db: firestore.Client):
+def render_reports_fallback(*_):
     st.subheader("Рецепты • Отчёты (fallback)")
-    st.write("После исправления структуры появятся отчёты.")
 
+# ---------- приложение ----------
 
-# ===== Главный UI =====
 def main():
-    st.set_page_config(
-        page_title="Gipsy Office — учёт",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+    st.set_page_config(page_title="Gipsy Office — учёт", layout="wide", initial_sidebar_state="expanded")
     st.title("gipsy office — учёт")
 
-    # если модульная структура ОК — используем её; иначе фоллбэк
-    if not USE_FALLBACK:
-        get_db = _get_db
-        render_sale = _render_sale
-        render_inventory = _render_inventory
-        render_reports = _render_reports
-    else:
-        get_db = get_db_fallback
-        render_sale = render_sale_fallback
-        render_inventory = render_inventory_fallback
-        render_reports = render_reports_fallback
-
-    db = get_db()
+    get_db, render_sale, render_inventory, render_reports, import_errs = _safe_import()
 
     st.sidebar.header("Навигация")
     page = st.sidebar.radio(
@@ -134,17 +136,17 @@ def main():
 
     sidebar_secrets_check()
 
-    if USE_FALLBACK:
+    if import_errs:
+        e1, e2 = import_errs
         st.sidebar.markdown("---")
         st.sidebar.error("⚠️ Модульная структура не импортируется")
-        st.sidebar.code(f"{type(IMPORT_ERR).__name__}: {IMPORT_ERR}")
-        with st.sidebar.expander("📁 Текущее дерево проекта (top)", expanded=False):
-            for line in list_repo_tree():
-                st.text(line)
+        st.sidebar.code(f"primary: {type(e1).__name__}: {e1}\nfallback: {type(e2).__name__}: {e2}")
+        st.sidebar.caption("Ниже дерево репозитория (первые ~300 строк):")
+        st.sidebar.code(_repo_tree())
 
-        # безопасно вставляем подсказку с помощью st.sidebar.write вместо тройных кавычек
+        # показываем, как должно быть
         st.sidebar.write(
-            "**Как должно быть в репозитории (всё в корне):**\n"
+            "**Ожидаемая структура рядом со `streamlit_app.py`:**\n"
             "```\n"
             "streamlit_app.py\n"
             "app/\n"
@@ -166,11 +168,19 @@ def main():
             "    __init__.py\n"
             "    format.py\n"
             "```\n"
-            "⚙️ Убедись, что:\n"
-            "- `app/` находится рядом со `streamlit_app.py`\n"
-            "- В каждой папке есть пустой `__init__.py`\n"
-            "- Имена файлов совпадают (регистр букв важен)"
+            "Проверь регистр имён и наличие `__init__.py`."
         )
+
+    # если импорт не удался — мягкие фоллбэки
+    if get_db is None:
+        render_sale = render_sale_fallback
+        render_inventory = render_inventory_fallback
+        render_reports = render_reports_fallback
+
+        # без БД всё равно позволим открыть вкладки, чтобы увидеть подсказки
+        db = None
+    else:
+        db = get_db()
 
     st.divider()
     if page == "Продажи":
@@ -179,7 +189,6 @@ def main():
         render_inventory(db)
     else:
         render_reports(db)
-
 
 if __name__ == "__main__":
     main()
