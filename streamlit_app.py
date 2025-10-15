@@ -1,37 +1,66 @@
 import os
 import sys
 import json
-import importlib
 import importlib.util
 from types import ModuleType
 import streamlit as st
 
-# ---------- утилиты динамической загрузки ----------
+# ---------- где искать ----------
+# Текущая папка файла
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-ROOT = os.path.dirname(__file__)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# Кандидаты для обхода: текущая, 1–3 родителя, и /mount/src (корень чекаута на Streamlit)
+SEARCH_ROOTS = []
+cur = HERE
+for _ in range(4):
+    if cur not in SEARCH_ROOTS:
+        SEARCH_ROOTS.append(cur)
+    parent = os.path.dirname(cur)
+    if parent == cur:
+        break
+    cur = parent
 
-def _repo_tree(max_lines=300):
+# Иногда Streamlit кладёт репозиторий в /mount/src/<repo>
+MOUNT_SRC = "/mount/src"
+if os.path.exists(MOUNT_SRC):
+    SEARCH_ROOTS.append(MOUNT_SRC)
+
+# гарантируем sys.path
+for p in [HERE] + SEARCH_ROOTS:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
+def repo_tree(max_lines=600):
+    """Показывает, что реально видит рантайм (для дебага)."""
     rows = []
-    for root, dirs, files in os.walk(ROOT):
-        if len(rows) >= max_lines:
-            rows.append("… (truncated)")
-            break
-        rel = os.path.relpath(root, ROOT)
-        rows.append(f"[DIR] {'.' if rel == '.' else rel}")
-        for f in files:
-            rows.append(f"     └─ {f}")
+    seen = set()
+    for root in SEARCH_ROOTS:
+        if not os.path.isdir(root) or root in seen:
+            continue
+        seen.add(root)
+        rows.append(f"=== ROOT: {root} ===")
+        for r, dirs, files in os.walk(root):
+            rel = os.path.relpath(r, root)
+            rows.append(f"[DIR] {'.' if rel == '.' else rel}")
+            for f in files:
+                rows.append(f"     └─ {f}")
+            if len(rows) >= max_lines:
+                rows.append("… (truncated)")
+                return "\n".join(rows)
     return "\n".join(rows)
 
-def _find_file(filename: str) -> str | None:
-    """Рекурсивно ищет первый попавшийся файл с таким именем внутри репо."""
-    for root, _, files in os.walk(ROOT):
-        if filename in files:
-            return os.path.join(root, filename)
+
+def find_file(filename: str) -> str | None:
+    """Ищет первый попавшийся файл по имени в SEARCH_ROOTS."""
+    for root in SEARCH_ROOTS:
+        for r, _, files in os.walk(root):
+            if filename in files:
+                return os.path.join(r, filename)
     return None
 
-def _load_module_from_path(mod_name: str, file_path: str) -> ModuleType:
+
+def load_module_from_path(mod_name: str, file_path: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(mod_name, file_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create spec for {mod_name} at {file_path}")
@@ -40,10 +69,11 @@ def _load_module_from_path(mod_name: str, file_path: str) -> ModuleType:
     sys.modules[mod_name] = mod
     return mod
 
-def _safe_import():
+
+def try_import_modules():
     """
-    1) пытаемся обычные импорты пакета app.*
-    2) если не вышло — ищем файлы по имени и подгружаем напрямую
+    1) Пытаемся обычные импорты (если app/ в PYTHONPATH)
+    2) Иначе ищем файлы по именам и грузим напрямую
     """
     try:
         from app.services.firestore_client import get_db as get_db  # type: ignore
@@ -51,39 +81,35 @@ def _safe_import():
         from app.ui_inventory import render_inventory             # type: ignore
         from app.ui_reports import render_reports                 # type: ignore
         return get_db, render_sale, render_inventory, render_reports, None
-    except Exception as e:
-        # План Б: загружаем по путям файлов
+    except Exception as e_primary:
+        # поимённый поиск
+        targets = {
+            "fc": "firestore_client.py",
+            "sale": "ui_sale.py",
+            "inv": "ui_inventory.py",
+            "rep": "ui_reports.py",
+        }
+        paths = {k: find_file(v) for k, v in targets.items()}
+        missing = [v for k, v in targets.items() if not paths[k]]
+        if missing:
+            return None, None, None, None, (e_primary, f"Не найдены файлы: {', '.join(missing)}")
+
         try:
-            fc_path = _find_file("firestore_client.py")
-            s_path  = _find_file("ui_sale.py")
-            i_path  = _find_file("ui_inventory.py")
-            r_path  = _find_file("ui_reports.py")
-
-            missing = [n for n, p in [
-                ("firestore_client.py", fc_path),
-                ("ui_sale.py", s_path),
-                ("ui_inventory.py", i_path),
-                ("ui_reports.py", r_path),
-            ] if p is None]
-            if missing:
-                msg = "Не нашёл файлы: " + ", ".join(missing)
-                raise ImportError(msg)
-
-            fc_mod = _load_module_from_path("dyn_firestore_client", fc_path)  # type: ignore
-            s_mod  = _load_module_from_path("dyn_ui_sale", s_path)            # type: ignore
-            i_mod  = _load_module_from_path("dyn_ui_inventory", i_path)       # type: ignore
-            r_mod  = _load_module_from_path("dyn_ui_reports", r_path)         # type: ignore
+            fc_mod = load_module_from_path("dyn_firestore_client", paths["fc"])  # type: ignore
+            sale_mod = load_module_from_path("dyn_ui_sale", paths["sale"])       # type: ignore
+            inv_mod = load_module_from_path("dyn_ui_inventory", paths["inv"])    # type: ignore
+            rep_mod = load_module_from_path("dyn_ui_reports", paths["rep"])      # type: ignore
 
             get_db = getattr(fc_mod, "get_db")
-            render_sale = getattr(s_mod, "render_sale")
-            render_inventory = getattr(i_mod, "render_inventory")
-            render_reports = getattr(r_mod, "render_reports")
+            render_sale = getattr(sale_mod, "render_sale")
+            render_inventory = getattr(inv_mod, "render_inventory")
+            render_reports = getattr(rep_mod, "render_reports")
             return get_db, render_sale, render_inventory, render_reports, None
-        except Exception as e2:
-            return None, None, None, None, (e, e2)
+        except Exception as e_fallback:
+            return None, None, None, None, (e_primary, e_fallback)
+
 
 # ---------- проверка secrets ----------
-
 def sidebar_secrets_check():
     with st.sidebar.expander("🔍 Secrets check", expanded=False):
         st.write("PROJECT_ID present:", bool(st.secrets.get("PROJECT_ID")))
@@ -94,23 +120,17 @@ def sidebar_secrets_check():
             try:
                 j = json.loads(svc)
                 st.write("json ok:", True)
-                st.write(
-                    "pk begins with BEGIN:",
-                    str(j.get("private_key", "")).strip().startswith("-----BEGIN"),
-                )
+                st.write("pk begins with BEGIN:", str(j.get("private_key", "")).strip().startswith("-----BEGIN"))
             except Exception as e:
                 st.write("json ok:", False, str(e))
         elif isinstance(svc, dict):
-            st.write(
-                "pk begins with BEGIN:",
-                str(svc.get("private_key", "")).strip().startswith("-----BEGIN"),
-            )
+            st.write("pk begins with BEGIN:", str(svc.get("private_key", "")).strip().startswith("-----BEGIN"))
 
-# ---------- фоллбэки экранов ----------
 
+# ---------- fallback экраны ----------
 def render_sale_fallback(*_):
     st.subheader("Продажи (fallback)")
-    st.info("UI-модуль не найден. Ниже подсказки по структуре.")
+    st.info("Не найден модуль `ui_sale.py`. Проверь структуру репозитория (см. сайдбар).")
 
 def render_inventory_fallback(*_):
     st.subheader("Склад (fallback)")
@@ -118,33 +138,26 @@ def render_inventory_fallback(*_):
 def render_reports_fallback(*_):
     st.subheader("Рецепты • Отчёты (fallback)")
 
-# ---------- приложение ----------
 
+# ---------- run ----------
 def main():
     st.set_page_config(page_title="Gipsy Office — учёт", layout="wide", initial_sidebar_state="expanded")
     st.title("gipsy office — учёт")
 
-    get_db, render_sale, render_inventory, render_reports, import_errs = _safe_import()
+    get_db, render_sale, render_inventory, render_reports, import_errs = try_import_modules()
 
     st.sidebar.header("Навигация")
-    page = st.sidebar.radio(
-        "Раздел",
-        ["Продажи", "Склад", "Рецепты • Отчёты"],
-        index=0,
-        label_visibility="collapsed",
-    )
-
+    page = st.sidebar.radio("Раздел", ["Продажи", "Склад", "Рецепты • Отчёты"], index=0, label_visibility="collapsed")
     sidebar_secrets_check()
 
     if import_errs:
-        e1, e2 = import_errs
         st.sidebar.markdown("---")
-        st.sidebar.error("⚠️ Модульная структура не импортируется")
-        st.sidebar.code(f"primary: {type(e1).__name__}: {e1}\nfallback: {type(e2).__name__}: {e2}")
-        st.sidebar.caption("Ниже дерево репозитория (первые ~300 строк):")
-        st.sidebar.code(_repo_tree())
+        st.sidebar.error("⚠️ Не удалось импортировать модули.")
+        e1, e2 = import_errs
+        st.sidebar.code(f"primary: {e1}\nfallback: {e2}")
+        st.sidebar.caption("Дерево того, что реально видит рантайм:")
+        st.sidebar.code(repo_tree())
 
-        # показываем, как должно быть
         st.sidebar.write(
             "**Ожидаемая структура рядом со `streamlit_app.py`:**\n"
             "```\n"
@@ -168,16 +181,14 @@ def main():
             "    __init__.py\n"
             "    format.py\n"
             "```\n"
-            "Проверь регистр имён и наличие `__init__.py`."
+            "Если файлы лежат глубже — этот файл всё равно их найдёт, но они должны **существовать в чекауте**."
         )
 
-    # если импорт не удался — мягкие фоллбэки
+    # Если импорты провалились — показываем фоллбэки, но приложение работает
     if get_db is None:
         render_sale = render_sale_fallback
         render_inventory = render_inventory_fallback
         render_reports = render_reports_fallback
-
-        # без БД всё равно позволим открыть вкладки, чтобы увидеть подсказки
         db = None
     else:
         db = get_db()
@@ -189,6 +200,7 @@ def main():
         render_inventory(db)
     else:
         render_reports(db)
+
 
 if __name__ == "__main__":
     main()
