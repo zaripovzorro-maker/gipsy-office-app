@@ -1,0 +1,31 @@
+name: Seed Firestore
+
+on:
+  workflow_dispatch: {}  # запуск вручную из GitHub → Actions → Run workflow
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Write service account file
+        run: |
+          echo "${{ secrets.FIREBASE_SA_JSON }}" > sa.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$GITHUB_WORKSPACE/sa.json" >> $GITHUB_ENV
+          echo "GOOGLE_CLOUD_PROJECT=${{ secrets.GCP_PROJECT_ID }}" >> $GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run seed script
+        run: |
+          python seeds/seed_firestore.py
