@@ -1,99 +1,145 @@
-from __future__ import annotations
+from typing import Dict, List
 import streamlit as st
-from typing import Dict, Any, List, Tuple
 from google.cloud import firestore
-from app.services.products import list_categories, list_products_by_category
-from app.services.sales import check_and_commit_sale
-from app.logic.calc import price_of_item
-from app.utils.format import money
 
-def _get_cart() -> List[Dict[str,Any]]:
+from app.services.inventory import fetch_inventory
+from app.services.products import fetch_products, fetch_recipes
+from app.logic.calc import total_cart_consumption, find_shortages
+from app.services.sales import commit_sale
+from app.utils.format import fmt_money_kop
+
+
+def _ensure_state():
     if "cart" not in st.session_state:
         st.session_state.cart = []
-    return st.session_state.cart
+    if "ui" not in st.session_state:
+        st.session_state.ui = {"category": None, "product": None}
+
+
+def _build_categories(products: Dict[str, dict]) -> Dict[str, List[dict]]:
+    cats = {}
+    for p in products.values():
+        cats.setdefault(p["category"], []).append(p)
+    return cats
+
 
 def render_sale(db: firestore.Client):
-    st.subheader("Продажа")
-    st.info("Сначала добавляйте в корзину. Списание со склада происходит только по кнопке «Купить».")
+    _ensure_state()
 
-    # категории
-    cats = list_categories(db)
-    if not cats:
-        st.warning("Нет активных продуктов. Заполните коллекцию `products` и `recipes`.")
+    st.subheader("Продажи")
+    st.info("Продажа проводится только при нажатии **«Купить»**. До этого позиции лежат в корзине и остатки не меняются.")
+
+    with st.spinner("Загрузка каталога..."):
+        inventory = fetch_inventory(db)
+        recipes = fetch_recipes(db)
+        products = fetch_products(db)
+
+    if not products:
+        st.warning("В коллекции **products** нет активных товаров.")
         return
 
-    if "active_cat" not in st.session_state:
-        st.session_state.active_cat = cats[0]
+    cats = _build_categories(products)
+    left, right = st.columns([7, 5], gap="large")
 
-    cat_cols = st.columns(min(5, len(cats)))
-    for i, c in enumerate(cats):
-        if cat_cols[i % len(cat_cols)].button(c, key=f"cat_{c}", type=("primary" if c==st.session_state.active_cat else "secondary")):
-            st.session_state.active_cat = c
+    # -------- ЛЕВО --------
+    with left:
+        st.markdown("### Категории")
+        cat_row = st.columns(4)
+        i = 0
+        for cat in sorted(cats.keys()):
+            with cat_row[i % 4]:
+                if st.button(f"🗂️ {cat}", use_container_width=True):
+                    st.session_state.ui["category"] = cat
+                    st.session_state.ui["product"] = None
+            i += 1
 
-    st.write("---")
-    st.caption(f"Категория: **{st.session_state.active_cat}**")
+        st.markdown("---")
+        cat = st.session_state.ui.get("category") or sorted(cats.keys())[0]
+        st.caption(f"Выбрана категория: **{cat}**")
 
-    # продукты
-    prods = list_products_by_category(db, st.session_state.active_cat)
-    grid = st.columns(3)
-    for idx, (pid, p) in enumerate(prods):
-        with grid[idx % 3]:
-            with st.container(border=True):
-                st.write(f"**{p.get('name','Без имени')}**")
-                volumes: List[int] = p.get("volumes") or []
-                base_price = int(p.get("base_price",0))
-                addons = p.get("addons") or []
+        prod_row = st.columns(4)
+        i = 0
+        for p in sorted(cats[cat], key=lambda x: x["name"]):
+            with prod_row[i % 4]:
+                if st.button(f"☕ {p['name']}", use_container_width=True):
+                    st.session_state.ui["product"] = p["id"]
+            i += 1
 
-                # объём
-                v = st.selectbox("Объём (мл)", volumes, key=f"v_{pid}")
-                # добавки
-                add_ids = []
-                if addons:
-                    st.caption("Добавки:")
-                    for a in addons:
-                        if st.checkbox(f"{a['name']} (+{money(a['price_delta'])})", key=f"ad_{pid}_{a['id']}"):
-                            add_ids.append(a["id"])
+        st.markdown("---")
+        pid = st.session_state.ui.get("product")
+        if pid:
+            prod = products[pid]
+            st.markdown(f"#### {prod['name']}")
+            vol = st.radio("Объём, мл", prod["volumes"], horizontal=True, index=0, key=f"vol_{pid}")
+            qty = st.number_input("Количество", 1, 20, 1, key=f"qty_{pid}")
 
-                qty = st.number_input("Кол-во", min_value=1, max_value=20, value=1, key=f"q_{pid}")
-                if st.button("В корзину", key=f"add_{pid}", use_container_width=True):
-                    _get_cart().append({
-                        "product_id": pid,
-                        "product_name": p.get("name",""),
-                        "volume_ml": int(v),
-                        "qty": int(qty),
-                        "addons": add_ids,
-                        "base_price": int(base_price),
-                        "product_doc": p,
-                    })
-                    st.success("Добавлено в корзину")
+            add_ids = []
+            if prod.get("addons"):
+                st.caption("Добавки:")
+                for add in prod["addons"]:
+                    if st.checkbox(
+                        f"{add['name']} (+{fmt_money_kop(int(add.get('price_delta',0)))})",
+                        key=f"add_{pid}_{add['id']}",
+                    ):
+                        add_ids.append(add["id"])
 
-    st.write("---")
-    st.subheader("🧺 Корзина")
-    cart = _get_cart()
-    if not cart:
-        st.info("Корзина пуста.")
-        return
+            price = int(prod["base_price"])
+            for add in prod.get("addons", []):
+                if add["id"] in add_ids:
+                    price += int(add.get("price_delta", 0))
+            total_item = price * int(qty)
 
-    total = 0
-    for i, it in enumerate(cart):
-        c1, c2, c3, c4 = st.columns([5,2,2,1])
-        with c1: st.write(f"{it['product_name']} — {it['volume_ml']} мл")
-        with c2: st.write(money(price_of_item(it)))
-        with c3:
-            new_q = st.number_input("qty", 1, 50, it["qty"], key=f"qty_{i}", label_visibility="collapsed")
-            it["qty"] = int(new_q)
-        with c4:
-            if st.button("✖", key=f"rm_{i}"):
-                cart.pop(i); st.experimental_rerun()
-        total += price_of_item(it)
+            st.write(f"**Цена за шт.:** {fmt_money_kop(price)}  |  **Итого:** {fmt_money_kop(total_item)}")
 
-    st.write(f"**Итого:** {money(total)}")
-    if st.button("Купить ✅", type="primary"):
-        res = check_and_commit_sale(db, cart)
-        if not res.get("ok"):
-            st.error(res.get("error","Ошибка"))
+            if st.button("➕ В корзину", type="primary"):
+                st.session_state.cart.append({
+                    "product_id": pid,
+                    "name": prod["name"],
+                    "volume_ml": float(vol),
+                    "qty": int(qty),
+                    "addons": add_ids,
+                    "price_total": total_item
+                })
+                st.success("Добавлено в корзину.")
+
+    # -------- ПРАВО --------
+    with right:
+        st.markdown("### 🧺 Корзина")
+        cart = st.session_state.cart
+        if not cart:
+            st.info("Корзина пуста. Добавьте напиток слева.")
         else:
-            st.success(f"Продажа проведена на {money(res['total_amount'])}")
-            st.session_state.cart = []
-            st.experimental_rerun()
+            for i, it in enumerate(cart):
+                st.markdown(
+                    f"{i+1}. **{it['name']}** — {int(it['volume_ml'])} мл × {it['qty']} | {fmt_money_kop(int(it['price_total']))}"
+                )
+                if st.button("Удалить", key=f"rm_{i}"):
+                    cart.pop(i)
+                    st.experimental_rerun()
 
+            st.markdown("---")
+            total = sum(int(i["price_total"]) for i in cart)
+            st.write(f"**Итого к оплате:** {fmt_money_kop(total)}")
+
+            need = total_cart_consumption(cart, products, recipes)
+            shortages = find_shortages(need, inventory)
+            if shortages:
+                with st.expander("❗ Возможная нехватка ингредиентов (предварительно)"):
+                    for s in shortages:
+                        st.write(f"- {s['ingredient_id']}: нужно {s['need']:.1f}, есть {s['have']:.1f} (дефицит {s['deficit']:.1f})")
+                st.warning("Покупка будет заблокирована, если нехватка подтвердится в транзакции.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🗑️ Очистить корзину", use_container_width=True):
+                    st.session_state.cart = []
+                    st.experimental_rerun()
+            with c2:
+                if st.button("💳 Купить", type="primary", use_container_width=True):
+                    ok, msg = commit_sale(db, cart, products, recipes)
+                    if ok:
+                        st.success(f"Продажа проведена (sale_id={msg}).")
+                        st.session_state.cart = []
+                        st.balloons()
+                    else:
+                        st.error(f"Не удалось провести продажу: {msg}")
