@@ -8,6 +8,9 @@ ROOT = os.path.dirname(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# 🧩 добавляем путь на случай, если app/ находится во вложенной папке
+sys.path.append(os.path.join(ROOT, "gipsy-office-app"))
+
 # ===== Пытаемся импортнуть модульные экранчики =====
 USE_FALLBACK = False
 try:
