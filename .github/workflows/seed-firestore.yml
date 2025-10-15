@@ -5,6 +5,7 @@ on:
 jobs:
   seed:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,19 +17,16 @@ jobs:
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
         run: |
-          # пишем содержимое секрета в sa.json без изменений
-          cat > sa.json <<'JSON'
-          $FIREBASE_SA_JSON
-          JSON
+          echo "$FIREBASE_SA_JSON" > sa.json
+          echo "sa.json size: $(wc -c < sa.json) bytes"
 
       - name: Validate sa.json
         run: |
           python - << 'PY'
           import json
-          json.load(open('sa.json','r',encoding='utf-8'))
-          print('✓ sa.json is valid JSON')
+          json.load(open('sa.json'))
+          print("✓ sa.json valid")
           PY
-          head -n1 sa.json
 
       - name: Install deps
         run: pip install google-cloud-firestore google-auth
@@ -36,5 +34,5 @@ jobs:
       - name: Seed Firestore
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_PROJECT_ID: gipsy-office
         run: python seeds/seed_firestore.py
