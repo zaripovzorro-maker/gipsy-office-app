@@ -8,18 +8,19 @@ ROOT = os.path.dirname(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import os
-import sys
-import json
-import streamlit as st
-
-# гарантируем, что корень репозитория в пути поиска модулей
-ROOT = os.path.dirname(__file__)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
 # 🧩 добавляем путь на случай, если app/ находится во вложенной папке
 sys.path.append(os.path.join(ROOT, "gipsy-office-app"))
+
+# ===== Пытаемся импортнуть модульные экранчики =====
+USE_FALLBACK = False
+try:
+    from app.services.firestore_client import get_db as _get_db
+    from app.ui_sale import render_sale as _render_sale
+    from app.ui_inventory import render_inventory as _render_inventory
+    from app.ui_reports import render_reports as _render_reports
+except Exception as e:
+    USE_FALLBACK = True
+    IMPORT_ERR = e
 
 # ===== Общие утилиты =====
 from google.cloud import firestore
