@@ -1,44 +1,64 @@
-from __future__ import annotations
-from typing import Dict, Any, List
-from google.cloud import firestore
-from app.services.products import load_recipe
+from typing import Dict, List
 
-def compute_item_consumption(db: firestore.Client, product: Dict[str,Any], volume_ml: int, addon_ids: List[str]) -> Dict[str,float]:
-    # product.recipe_ref -> recipes/{id}
-    r = load_recipe(db, product.get("recipe_ref","") or "")
-    if not r:
-        return {}  # без рецепта не списываем (или можно жёстко блокировать)
 
-    base_vol = float(r.get("base_volume_ml") or 0) or 200.0
-    mult = float(volume_ml) / base_vol
+def compute_base_consumption(recipe: dict, volume_ml: float) -> Dict[str, float]:
+    base_ml = float(recipe.get("base_volume_ml", 200)) or 200.0
+    k = volume_ml / base_ml
+    out: Dict[str, float] = {}
+    for item in recipe.get("ingredients", []):
+        iid = item["ingredient_id"]
+        qty = float(item["qty"])
+        out[iid] = out.get(iid, 0.0) + qty * k
+    return out
 
-    cons: Dict[str,float] = {}
-    for ing in r.get("ingredients", []):
-        iid = ing["ingredient_id"]; qty = float(ing["qty"])
-        cons[iid] = cons.get(iid, 0.0) + qty * mult
 
-    # добавки (каждая добавка: ingredients:{id: qty})
-    addons_map = {a["id"]: a for a in (product.get("addons") or [])}
-    for aid in addon_ids:
-        a = addons_map.get(aid)
-        if not a: continue
-        for iid, qty in (a.get("ingredients") or {}).items():
-            cons[iid] = cons.get(iid, 0.0) + float(qty)
+def consumption_for_item(product: dict, volume_ml: float, addon_ids: List[str], recipes: Dict[str, dict]) -> Dict[str, float]:
+    total: Dict[str, float] = {}
 
-    return cons
+    rkey = None
+    if product.get("recipe_ref"):
+        if isinstance(product["recipe_ref"], str):
+            rkey = product["recipe_ref"].split("/")[-1]
+        elif isinstance(product["recipe_ref"], dict) and "path" in product["recipe_ref"]:
+            rkey = str(product["recipe_ref"]["path"]).split("/")[-1]
 
-def aggregate_consumption(item_consumptions: List[Dict[str,float]]) -> Dict[str,float]:
-    agg: Dict[str,float] = {}
-    for c in item_consumptions:
-        for k,v in c.items():
-            agg[k] = agg.get(k, 0.0) + float(v)
-    return agg
+    if rkey and rkey in recipes:
+        total = sum_maps(total, compute_base_consumption(recipes[rkey], volume_ml))
 
-def price_of_item(item: Dict[str,Any]) -> int:
-    # price = base_price*qty + sum(addon.price_delta)*qty
-    base = int(item.get("base_price",0))
-    addons = item.get("addons", [])
-    product_addons = {a["id"]: a for a in (item["product_doc"].get("addons") or [])}
-    addons_sum = sum(int(product_addons[a]["price_delta"]) for a in addons if a in product_addons)
-    return (base + addons_sum) * int(item.get("qty",1))
+    addons = {a["id"]: a for a in product.get("addons", [])}
+    for add_id in addon_ids:
+        ad = addons.get(add_id)
+        if not ad:
+            continue
+        for iid, q in (ad.get("ingredients") or {}).items():
+            total[iid] = total.get(iid, 0.0) + float(q)
 
+    return total
+
+
+def sum_maps(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+    out = dict(a)
+    for k, v in b.items():
+        out[k] = out.get(k, 0.0) + v
+    return out
+
+
+def total_cart_consumption(cart: List[dict], products: Dict[str, dict], recipes: Dict[str, dict]) -> Dict[str, float]:
+    need: Dict[str, float] = {}
+    for item in cart:
+        prod = products.get(item["product_id"])
+        if not prod:
+            continue
+        cons = consumption_for_item(prod, item["volume_ml"], item.get("addons", []), recipes)
+        for k, v in cons.items():
+            need[k] = need.get(k, 0.0) + v * int(item["qty"])
+    return need
+
+
+def find_shortages(need: Dict[str, float], inventory: Dict[str, dict]):
+    shortages = []
+    for iid, req in need.items():
+        have = float(inventory.get(iid, {}).get("current", 0.0))
+        if have + 1e-9 < req:
+            shortages.append({"ingredient_id": iid, "need": req, "have": have, "deficit": req - have})
+    return shortages
