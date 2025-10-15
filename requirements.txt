@@ -1,6 +1,4 @@
-streamlit==1.50.0
-firebase-admin==7.1.0
-google-cloud-firestore==2.21.0
-pandas==2.3.3
-qrcode[pil]==7.4.2
-
+streamlit~=1.36
+firebase-admin~=6.5
+google-cloud-firestore~=2.16
+pandas>=2.2
