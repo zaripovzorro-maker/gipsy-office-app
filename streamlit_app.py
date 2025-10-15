@@ -122,5 +122,3 @@ def main():
             for line in list_repo_tree():
                 st.text(line)
         st.sidebar.markdown(
-            """
-**Что нужно иметь в корне (строго по путям):**
